@@ -64,6 +64,14 @@ export function createCli(deps: CliDeps): Cli {
         output: process.stdout,
         terminal: true,
       });
+      // Prevent readline from auto-closing on Ctrl+C. Without a listener here,
+      // readline detects ^C in raw mode and calls this.close() before our
+      // process SIGINT handler gets a chance to run, causing ERR_USE_AFTER_CLOSE
+      // on the next readline.question() call. Re-emitting to process routes
+      // control to our existing process.on('SIGINT') handler.
+      rl.on('SIGINT', () => {
+        process.emit('SIGINT');
+      });
     }
     return rl;
   }

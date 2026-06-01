@@ -21,6 +21,7 @@ type QuestionCallback = (answer: string) => void;
 const mockRl = {
   question: vi.fn<[string, QuestionCallback], void>(),
   close: vi.fn(),
+  on: vi.fn(),
   terminal: true,
 };
 
