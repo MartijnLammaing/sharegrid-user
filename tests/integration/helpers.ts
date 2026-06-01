@@ -129,6 +129,11 @@ export interface MockHost {
   promptChunks: string[];
   /** Whether to send session_timeout instead of response chunks */
   sendTimeout: boolean;
+  /**
+   * If set, the mock host sends this many chunks then pauses, waiting for a
+   * prompt_cancel before sending prompt_cancelled. Use for cancel tests.
+   */
+  pauseAfterChunks: number | null;
   stop(): void;
 }
 
@@ -162,6 +167,7 @@ export async function startMockHost(): Promise<MockHost> {
     sessionRejectReason: null,
     promptChunks: ['Hello from mock host'],
     sendTimeout: false,
+    pauseAfterChunks: null,
     stop() { server.close(); },
   };
 
@@ -197,12 +203,21 @@ export async function startMockHost(): Promise<MockHost> {
           if (state.sendTimeout) {
             sendMsg(sock, { v: PROTOCOL_VERSION, type: 'session_timeout' });
             sock.end();
+          } else if (state.pauseAfterChunks !== null) {
+            // Send the first N chunks then pause — wait for prompt_cancel.
+            const n = state.pauseAfterChunks;
+            for (let i = 0; i < n && i < state.promptChunks.length; i++) {
+              sendMsg(sock, { v: PROTOCOL_VERSION, type: 'response_chunk', content: state.promptChunks[i]! });
+            }
+            // Do NOT send response_end — leave the stream open until cancelled.
           } else {
             for (const c of state.promptChunks) {
               sendMsg(sock, { v: PROTOCOL_VERSION, type: 'response_chunk', content: c });
             }
             sendMsg(sock, { v: PROTOCOL_VERSION, type: 'response_end' });
           }
+        } else if (msg['type'] === 'prompt_cancel' && sessionOpen) {
+          sendMsg(sock, { v: PROTOCOL_VERSION, type: 'prompt_cancelled' });
         } else if (msg['type'] === 'session_close') {
           sock.end();
         }

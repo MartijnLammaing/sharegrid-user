@@ -21,6 +21,7 @@ import type { RouterClient } from './router-client.js';
 import type { SessionClient } from './session-client.js';
 import {
   SessionTimeoutError,
+  PromptCancelledError,
   TlsFingerprintError,
   HostBusyError,
   InvalidTokenError,
@@ -52,6 +53,7 @@ export function createCli(deps: CliDeps): Cli {
 
   let rl: ReadlineInterface | null = null;
   let sessionOpen = false;
+  let generationInFlight = false;
 
   // ── Readline helpers ──────────────────────────────────────────────────────
 
@@ -118,7 +120,7 @@ export function createCli(deps: CliDeps): Cli {
   async function conversationLoop(host: HostListEntry): Promise<'reselect' | 'refetch' | 'exit'> {
     const messages: Array<{ role: 'user' | 'assistant'; content: string }> = [];
 
-    process.stdout.write(`\nConnected to ${host.modelName}. Type a message, or Ctrl+C to exit.\n\n`);
+    process.stdout.write(`\nConnected to ${host.modelName}. Type a message, Ctrl+C to stop generation, Ctrl+C again to exit.\n\n`);
 
     while (true) {
       const input = await prompt('You: ');
@@ -131,6 +133,7 @@ export function createCli(deps: CliDeps): Cli {
 
       let accumulated = '';
       try {
+        generationInFlight = true;
         await sessionClient.sendPrompt(
           messages,
           (chunk) => {
@@ -145,7 +148,14 @@ export function createCli(deps: CliDeps): Cli {
         messages.push({ role: 'assistant', content: accumulated });
       } catch (err) {
         process.stdout.write('\n');
-        return handlePromptError(err);
+        if (err instanceof PromptCancelledError) {
+          process.stdout.write('[stopped]\n\n');
+          // Discard partial response; do not add to history. Continue the loop.
+        } else {
+          return handlePromptError(err);
+        }
+      } finally {
+        generationInFlight = false;
       }
     }
   }
@@ -241,6 +251,16 @@ export function createCli(deps: CliDeps): Cli {
   function registerSigint(): void {
     process.on('SIGINT', () => {
       void (async () => {
+        if (generationInFlight) {
+          // Cancel the in-flight response without exiting.
+          try {
+            await sessionClient.cancelPrompt();
+          } catch {
+            // ignore — PromptCancelledError will surface through sendPrompt
+          }
+          return;
+        }
+        // Not generating — exit cleanly.
         process.stdout.write('\n\nGoodbye.\n');
         if (sessionOpen) {
           try {

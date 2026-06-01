@@ -29,7 +29,7 @@ vi.mock('node:readline', () => ({
 }));
 
 const { createCli } = await import('../../src/cli.js');
-const { SessionTimeoutError } = await import('../../src/session-client.js');
+const { SessionTimeoutError, PromptCancelledError } = await import('../../src/session-client.js');
 
 const logger = pino({ level: 'silent' });
 
@@ -69,6 +69,9 @@ describe('CLI', () => {
       return true;
     });
     vi.clearAllMocks();
+    // Remove any SIGINT listeners registered by previous tests so they don't
+    // fire when this test emits SIGINT.
+    process.removeAllListeners('SIGINT');
   });
 
   afterEach(() => {
@@ -97,6 +100,7 @@ describe('CLI', () => {
           return Promise.resolve();
         },
       ),
+      cancelPrompt: vi.fn().mockResolvedValue(undefined),
       closeSession: vi.fn().mockResolvedValue(undefined),
     };
     return sc;
@@ -217,65 +221,164 @@ describe('CLI', () => {
     expect(stdoutOutput.toLowerCase()).toContain('timed out');
   });
 
-  // ─── Test: Ctrl+C calls closeSession ─────────────────────────────────────
+  // ─── Test: Ctrl+C at idle prompt closes session and exits ────────────────
 
-  it('Ctrl+C with an active session calls closeSession and prints goodbye', async () => {
+  it('Ctrl+C at idle prompt (no generation in flight) calls closeSession and prints goodbye', async () => {
     const hosts = makeHosts(1);
     const rc = makeRouterClient(hosts);
-    let sendPromptReject: (e: Error) => void;
     const sc = {
       openSession: vi.fn().mockResolvedValue(undefined),
-      sendPrompt: vi.fn().mockReturnValue(
-        new Promise<void>((_res, rej) => { sendPromptReject = rej; }),
-      ),
+      sendPrompt: vi.fn(), // never called in this test
+      cancelPrompt: vi.fn().mockResolvedValue(undefined),
       closeSession: vi.fn().mockResolvedValue(undefined),
     };
 
     // Override process.exit so Vitest doesn't intercept it as an error.
     const proc = process as { exit: (code?: number) => never };
-    const exitSpy: MockInstance<(code?: number) => never> = vi.spyOn(proc, 'exit').mockImplementation((_code?: number): never => {
-      // Don't throw — just absorb and return (TypeScript: never, but runtime: void).
-      return undefined as never;
-    });
+    const exitSpy: MockInstance<(code?: number) => never> = vi.spyOn(proc, 'exit').mockImplementation(
+      (_code?: number): never => undefined as never,
+    );
 
-    // Answers: select host 1, then prompt (send prompt blocks until SIGINT)
+    // promptCall=1: host selection; promptCall=2: "You:" prompt where SIGINT fires.
+    // After process.exit is absorbed we answer so run() can drain via refetch.
     let promptCall = 0;
+    let sigintFired = false;
     mockRl.question.mockImplementation((_q: string, cb: QuestionCallback) => {
       promptCall++;
       if (promptCall === 1) {
-        setTimeout(() => cb('1'), 0); // host selection
-      } else if (promptCall === 2) {
-        // Deliver the prompt answer, then after a tick fire SIGINT
+        setTimeout(() => cb('1'), 0); // initial host selection
+      } else if (!sigintFired) {
+        // First non-selection prompt ("You:"): fire SIGINT exactly once.
+        sigintFired = true;
         setTimeout(() => {
-          cb('hello'); // start sending prompt
-          // After prompt starts, fire SIGINT which calls closeSession + exit
-          setTimeout(() => {
-            process.emit('SIGINT');
-            // After SIGINT: CLI calls closeSession() and process.exit(0).
-            // process.exit is mocked to do nothing, so run() continues.
-            // Reject the sendPrompt to let the conversation loop exit.
-            setTimeout(() => {
-              sendPromptReject(new Error('closed by SIGINT'));
-            }, 10);
-          }, 5);
-        }, 0);
-      }
-      // Any further questions: return empty string so eventually we refetch empty
-      else {
+          process.emit('SIGINT'); // generationInFlight===false → closeSession + exit(0)
+          // Provide answer after exit is absorbed so the awaited prompt() resolves
+          // and run() can continue via the reselect/refetch termination path.
+          setTimeout(() => cb('hello'), 20);
+        }, 5);
+      } else {
+        // Subsequent questions (re-selection): return '1' to drive the termination path.
         setTimeout(() => cb('1'), 0);
       }
     });
 
-    // After SIGINT + sendPrompt rejection, conversationLoop returns 'reselect'.
-    // reselect → openSession → InvalidTokenError → refetch → [] → done.
+    // After SIGINT-triggered reselect, openSession → InvalidTokenError → refetch → [] → done.
     sc.openSession
-      .mockResolvedValueOnce(undefined)                    // first open succeeds
-      .mockRejectedValueOnce(new InvalidTokenError());     // reselect open fails → refetch
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new InvalidTokenError());
+    sc.sendPrompt.mockRejectedValue(new SessionTimeoutError());
 
     await createCli({ routerClient: rc, sessionClient: sc, logger }).run();
 
     expect(sc.closeSession).toHaveBeenCalled();
     expect(stdoutOutput).toContain('Goodbye');
     expect(exitSpy).toHaveBeenCalledWith(0);
+  });
+
+  // ─── Test: SIGINT during generation calls cancelPrompt, not exit ──────────
+
+  it('SIGINT during generation calls cancelPrompt and prints [stopped] without exiting', async () => {
+    const hosts = makeHosts(1);
+    const rc = makeRouterClient(hosts);
+
+    // sendPrompt: first call blocks (will be cancelled); second call throws SessionTimeoutError
+    // to exit conversationLoop → reselect → InvalidTokenError → refetch → [] → done.
+    let sendPromptReject: (e: Error) => void;
+    let sendCallCount = 0;
+    const sc = {
+      openSession: vi.fn()
+        .mockResolvedValueOnce(undefined)          // first open succeeds
+        .mockRejectedValueOnce(new InvalidTokenError()), // reselect open fails → refetch → done
+      sendPrompt: vi.fn().mockImplementation(
+        (_msgs: unknown, _onChunk: unknown, _onEnd: unknown): Promise<void> => {
+          sendCallCount++;
+          if (sendCallCount === 1) {
+            return new Promise<void>((_res, rej) => { sendPromptReject = rej; });
+          }
+          return Promise.reject(new SessionTimeoutError());
+        },
+      ),
+      cancelPrompt: vi.fn().mockResolvedValue(undefined),
+      closeSession: vi.fn().mockResolvedValue(undefined),
+    };
+
+    const proc = process as { exit: (code?: number) => never };
+    const exitSpy: MockInstance<(code?: number) => never> = vi.spyOn(proc, 'exit').mockImplementation(
+      (_code?: number): never => undefined as never,
+    );
+
+    let promptCall = 0;
+    mockRl.question.mockImplementation((_q: string, cb: QuestionCallback) => {
+      promptCall++;
+      if (promptCall === 1) {
+        setTimeout(() => cb('1'), 0); // initial host selection
+      } else if (promptCall === 2) {
+        setTimeout(() => {
+          cb('hello'); // triggers sendPrompt (which blocks)
+          setTimeout(() => {
+            // Fire SIGINT while generation is in flight.
+            process.emit('SIGINT');
+            // After cancelPrompt resolves, reject sendPrompt with PromptCancelledError.
+            setTimeout(() => { sendPromptReject(new PromptCancelledError()); }, 10);
+          }, 5);
+        }, 0);
+      } else if (promptCall === 3) {
+        // After [stopped] the loop continues; triggers second sendPrompt
+        // which throws SessionTimeoutError → conversationLoop returns 'reselect'.
+        setTimeout(() => cb('follow-up'), 0);
+      } else {
+        // Host re-selection after reselect: '1' → openSession throws InvalidTokenError
+        // → refetch → [] → run() completes.
+        setTimeout(() => cb('1'), 0);
+      }
+    });
+
+    await createCli({ routerClient: rc, sessionClient: sc, logger }).run();
+
+    expect(sc.cancelPrompt).toHaveBeenCalled();
+    expect(stdoutOutput).toContain('[stopped]');
+    expect(exitSpy).not.toHaveBeenCalled();
+  }, 10_000);
+
+  // ─── Test: PromptCancelledError discards partial response ────────────────
+
+  it('PromptCancelledError discards partial response and does not add to messages', async () => {
+    const hosts = makeHosts(1);
+    const rc = makeRouterClient(hosts);
+
+    let sendCallCount = 0;
+    let capturedMessages: Array<unknown>[] = [];
+    const sc = {
+      openSession: vi.fn().mockResolvedValue(undefined),
+      sendPrompt: vi.fn().mockImplementation(
+        (msgs: unknown, _onChunk: unknown, _onEnd: unknown): Promise<void> => {
+          capturedMessages.push(msgs as unknown[]);
+          sendCallCount++;
+          if (sendCallCount === 1) {
+            // First call: emit a partial chunk then reject with PromptCancelledError.
+            return Promise.reject(new PromptCancelledError());
+          }
+          // Second call: succeed normally so the test can terminate.
+          return Promise.reject(new InvalidTokenError());
+        },
+      ),
+      cancelPrompt: vi.fn().mockResolvedValue(undefined),
+      closeSession: vi.fn().mockResolvedValue(undefined),
+    };
+
+    queueAnswers(['1', 'first prompt', 'second prompt']);
+
+    await createCli({ routerClient: rc, sessionClient: sc, logger }).run();
+
+    // The cancelled turn must not appear in the messages array sent on the
+    // second sendPrompt call — only the original user message.
+    expect(stdoutOutput).toContain('[stopped]');
+    // Second sendPrompt should only contain the first user message (no assistant
+    // turn from the cancelled response).
+    if (capturedMessages[1]) {
+      const secondCallMessages = capturedMessages[1] as Array<{ role: string }>;
+      const assistantTurns = secondCallMessages.filter((m) => m.role === 'assistant');
+      expect(assistantTurns).toHaveLength(0);
+    }
   });
 });

@@ -30,6 +30,8 @@ import {
   type SessionAck,
   type SessionReject,
   type PromptPayload,
+  type PromptCancel,
+  type PromptCancelled,
   type ResponseChunk,
   type ResponseEnd,
   type SessionClose,
@@ -47,6 +49,15 @@ export class SessionTimeoutError extends Error {
   constructor(message = 'session timed out') {
     super(message);
     this.name = 'SessionTimeoutError';
+  }
+}
+
+/** The in-flight prompt was cancelled by the user via cancelPrompt(). */
+export class PromptCancelledError extends Error {
+  readonly code = 'PROMPT_CANCELLED' as const;
+  constructor(message = 'prompt cancelled') {
+    super(message);
+    this.name = 'PromptCancelledError';
   }
 }
 
@@ -78,12 +89,20 @@ export interface SessionClient {
    * @param onChunk   Called for each streamed response token.
    * @param onEnd     Called once when the response is complete.
    * @throws {SessionTimeoutError}   if the host times out the session mid-prompt.
+   * @throws {PromptCancelledError}  if cancelPrompt() was called while in flight.
    */
   sendPrompt(
     messages: ChatMessage[],
     onChunk: (content: string) => void,
     onEnd: () => void,
   ): Promise<void>;
+
+  /**
+   * Cancel the in-flight prompt. Sends prompt_cancel to the host and waits for
+   * prompt_cancelled. The in-flight sendPrompt promise rejects with
+   * PromptCancelledError. No-op if no prompt is in flight.
+   */
+  cancelPrompt(): Promise<void>;
 
   /** Send SessionClose and close the socket. */
   closeSession(): Promise<void>;
@@ -111,6 +130,9 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
   // waiting for a response, cleared when the response completes.
   let promptResolve: (() => void) | null = null;
   let promptReject: ((err: Error) => void) | null = null;
+
+  // cancelPrompt bookkeeping: set while waiting for prompt_cancelled from host.
+  let cancelResolve: (() => void) | null = null;
 
   // ── NDJSON framing ────────────────────────────────────────────────────────
 
@@ -294,6 +316,16 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
         res?.();
         break;
       }
+      case 'prompt_cancelled': {
+        const _pc: PromptCancelled = msg;
+        void _pc;
+        // Resolve the cancelPrompt() promise first, then reject sendPrompt.
+        const res = cancelResolve;
+        cancelResolve = null;
+        res?.();
+        rejectInFlight(new PromptCancelledError());
+        break;
+      }
       case 'session_timeout': {
         const _t: SessionTimeout = msg;
         void _t;
@@ -368,6 +400,21 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
     });
   }
 
+  // ── cancelPrompt ──────────────────────────────────────────────────────────
+
+  async function cancelPrompt(): Promise<void> {
+    if (!sessionActive || sock === null || promptResolve === null) {
+      // No prompt in flight — nothing to cancel.
+      return;
+    }
+
+    return new Promise<void>((resolve) => {
+      cancelResolve = resolve;
+      const payload: PromptCancel = { v: PROTOCOL_VERSION, type: 'prompt_cancel' };
+      writeMessage(payload);
+    });
+  }
+
   // ── closeSession ──────────────────────────────────────────────────────────
 
   async function closeSession(): Promise<void> {
@@ -392,7 +439,7 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
     sock = null;
   }
 
-  return { openSession, sendPrompt, closeSession };
+  return { openSession, sendPrompt, cancelPrompt, closeSession };
 }
 
 export {
