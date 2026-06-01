@@ -41,6 +41,8 @@ RUN groupadd --gid 1001 sharegrid \
 
 WORKDIR /app
 
+ENV NODE_ENV=production
+
 COPY --from=builder /app/dist/bundle.cjs /app/bundle.cjs
 
 USER sharegrid

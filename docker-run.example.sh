@@ -10,8 +10,9 @@
 #
 # See: docs/architecture_llmuser.md §2.4
 
-docker run \
-  -it \
-  --rm \
-  -e SHAREGRID_ROUTER_URL="https://router.example.com:8443?fp=sha256:<fingerprint>" \
-  registry/llmuser@sha256:<digest>
+## Build
+cd sharegrid-user
+docker build -t sharegrid-user .
+
+## Run
+docker run -it --rm -e SHAREGRID_ROUTER_URL="https://172.17.0.2:8443?fp=sha256:6059adc8a497ba0070f0f10af6ce130ae58a46c83e70c4ed98e12b5bfd01f98e" sharegrid-user:latest

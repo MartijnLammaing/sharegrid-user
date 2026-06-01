@@ -91,7 +91,7 @@ export function createCli(deps: CliDeps): Cli {
     process.stdout.write('\nAvailable hosts:\n\n');
     hosts.forEach((h, i) => {
       process.stdout.write(
-        `  [${i + 1}] ${h.modelName}  context: ${h.contextSize.toLocaleString()} tokens  endpoint: ${h.endpoint}\n`,
+        `  [${i + 1}] ${h.modelName}  endpoint: ${h.endpoint}\n`,
       );
     });
     process.stdout.write('\n');
