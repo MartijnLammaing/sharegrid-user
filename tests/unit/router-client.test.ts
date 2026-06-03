@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { TlsFingerprintError, RoleKeyMissingError } from '@sharegrid/shared/errors';
+import { TlsFingerprintError } from '@sharegrid/shared/errors';
 import { PROTOCOL_VERSION } from '@sharegrid/shared/protocol';
 import pino from 'pino';
 

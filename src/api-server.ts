@@ -94,7 +94,7 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
     let rawBody: string;
     try {
       rawBody = await collectBody(req);
-    } catch (err) {
+    } catch {
       sendError(res, 400, 'failed to read request body', 'invalid_request');
       return;
     }
@@ -152,11 +152,13 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
       'Connection': 'keep-alive',
     });
 
-    // 6. Wire up cancellation: when the response is torn down (client disconnect
-    //    or server close), abort the inference so the host cleans up promptly.
+    // 6. Wire up cancellation for client disconnect.
+    //    `res.on('close')` fires on both client disconnect AND after res.end(),
+    //    so we only abort if inference hasn't already completed normally.
     const controller = new AbortController();
+    let inferenceCompleted = false;
     res.on('close', () => {
-      if (!controller.signal.aborted) {
+      if (!inferenceCompleted && !controller.signal.aborted) {
         controller.abort();
       }
     });
@@ -175,6 +177,7 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
       log.error({ err }, 'error during inference streaming');
     }
 
+    inferenceCompleted = true;
     res.end();
   }
 

@@ -2,8 +2,8 @@
  * Shared helpers for user integration tests.
  *
  * Provides real TLS servers acting as mock router and mock host so that the
- * Router Client and Session Client can be exercised against genuine network
- * connections.
+ * Router Client, Session Client, Host Session Pool, Model Registry, and API
+ * Server can be exercised against genuine network connections.
  */
 
 import { createServer as createTlsServer, type TLSSocket } from 'node:tls';
@@ -14,6 +14,11 @@ import { computeFingerprint } from '@sharegrid/shared/tls';
 import { signEd25519, encodeHostKeyToken } from '@sharegrid/shared/crypto';
 import { PROTOCOL_VERSION, type HostKeyTokenPayload, type HostListEntry } from '@sharegrid/shared/protocol';
 import pino from 'pino';
+import { createRouterClient } from '../../src/router-client.js';
+import { createModelRegistry } from '../../src/model-registry.js';
+import { createHostSessionPool } from '../../src/host-session-pool.js';
+import { createApiServer } from '../../src/api-server.js';
+import type { SessionClient } from '../../src/session-client.js';
 
 export const logger = pino({ level: 'silent' });
 
@@ -83,6 +88,10 @@ export async function startMockRouter(hosts: HostListEntry[], userSecret?: strin
   const port = await getFreePort();
   const secret = userSecret ?? `mock-user-secret-${Date.now()}`;
 
+  // Use a mutable reference so tests can swap hosts mid-run (e.g. set to []
+  // to trigger the CLI's "No hosts available" exit path).
+  const state: MockRouter = { port, fingerprint, hosts: [...hosts], userSecret: secret, stop() { server.close(); } };
+
   const server = createTlsServer({ cert, key }, (sock: TLSSocket) => {
     let buf = '';
     sock.setEncoding('utf8');
@@ -95,12 +104,9 @@ export async function startMockRouter(hosts: HostListEntry[], userSecret?: strin
         if (!line) continue;
         const msg = JSON.parse(line) as Record<string, unknown>;
         if (msg['type'] === 'host_list_request') {
-          // Validate roleKey — reject if missing or wrong
-          if (msg['roleKey'] !== secret) {
-            sock.destroy();
-            return;
-          }
-          sendMsg(sock, { v: PROTOCOL_VERSION, type: 'host_list_response', hosts });
+          if (msg['roleKey'] !== secret) { sock.destroy(); return; }
+          // Read from state.hosts so tests can mutate it between calls
+          sendMsg(sock, { v: PROTOCOL_VERSION, type: 'host_list_response', hosts: state.hosts });
           sock.end();
         }
       }
@@ -113,13 +119,7 @@ export async function startMockRouter(hosts: HostListEntry[], userSecret?: strin
     server.on('error', reject);
   });
 
-  return {
-    port,
-    fingerprint,
-    hosts,
-    userSecret: secret,
-    stop() { server.close(); },
-  };
+  return state;
 }
 
 // ── Mock Host ─────────────────────────────────────────────────────────────────
@@ -134,13 +134,13 @@ export interface MockHost {
   received: Array<Record<string, unknown>>;
   /** Override to make session_open return a rejection */
   sessionRejectReason: SessionRejectReason | null;
-  /** Chunks to send when a prompt arrives */
-  promptChunks: string[];
-  /** Whether to send session_timeout instead of response chunks */
+  /** Content chunks to emit as SSE delta.content for each inference_request */
+  inferenceChunks: string[];
+  /** Send session_timeout instead of inference_response_chunk on inference_request */
   sendTimeout: boolean;
   /**
-   * If set, the mock host sends this many chunks then pauses, waiting for a
-   * prompt_cancel before sending prompt_cancelled. Use for cancel tests.
+   * If set, send this many chunks then pause — do NOT send [DONE].
+   * Used by abort tests: the client will destroy the socket, closing the connection.
    */
   pauseAfterChunks: number | null;
   stop(): void;
@@ -150,10 +150,7 @@ export async function startMockHost(): Promise<MockHost> {
   const { cert, key, fingerprint } = generateCert();
   const port = await getFreePort();
 
-  // Generate an Ed25519 token for this host
-  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
-  const publicKeyPem = publicKey.export({ type: 'spki', format: 'pem' }) as string;
-  void publicKeyPem;
+  const { privateKey } = generateKeyPairSync('ed25519');
 
   function makeToken(): string {
     const payload: HostKeyTokenPayload = {
@@ -174,7 +171,7 @@ export async function startMockHost(): Promise<MockHost> {
     hostKeyToken,
     received: [],
     sessionRejectReason: null,
-    promptChunks: ['Hello from mock host'],
+    inferenceChunks: ['Hello from mock host'],
     sendTimeout: false,
     pauseAfterChunks: null,
     stop() { server.close(); },
@@ -198,35 +195,37 @@ export async function startMockHost(): Promise<MockHost> {
 
         if (msg['type'] === 'session_open') {
           if (state.sessionRejectReason !== null) {
-            sendMsg(sock, {
-              v: PROTOCOL_VERSION,
-              type: 'session_reject',
-              reason: state.sessionRejectReason,
-            });
+            sendMsg(sock, { v: PROTOCOL_VERSION, type: 'session_reject', reason: state.sessionRejectReason });
             sock.end();
           } else {
             sessionOpen = true;
             sendMsg(sock, { v: PROTOCOL_VERSION, type: 'session_ack' });
           }
-        } else if (msg['type'] === 'prompt' && sessionOpen) {
+        } else if (msg['type'] === 'inference_request' && sessionOpen) {
           if (state.sendTimeout) {
             sendMsg(sock, { v: PROTOCOL_VERSION, type: 'session_timeout' });
             sock.end();
           } else if (state.pauseAfterChunks !== null) {
-            // Send the first N chunks then pause — wait for prompt_cancel.
+            // Send N chunks then pause — caller destroys the socket to abort
             const n = state.pauseAfterChunks;
-            for (let i = 0; i < n && i < state.promptChunks.length; i++) {
-              sendMsg(sock, { v: PROTOCOL_VERSION, type: 'response_chunk', content: state.promptChunks[i]! });
+            for (let i = 0; i < n && i < state.inferenceChunks.length; i++) {
+              sendMsg(sock, {
+                v: PROTOCOL_VERSION,
+                type: 'inference_response_chunk',
+                data: `data: ${JSON.stringify({ choices: [{ delta: { content: state.inferenceChunks[i]! } }] })}`,
+              });
             }
-            // Do NOT send response_end — leave the stream open until cancelled.
+            // Do NOT send [DONE] — leave the stream open
           } else {
-            for (const c of state.promptChunks) {
-              sendMsg(sock, { v: PROTOCOL_VERSION, type: 'response_chunk', content: c });
+            for (const chunk of state.inferenceChunks) {
+              sendMsg(sock, {
+                v: PROTOCOL_VERSION,
+                type: 'inference_response_chunk',
+                data: `data: ${JSON.stringify({ choices: [{ delta: { content: chunk } }] })}`,
+              });
             }
-            sendMsg(sock, { v: PROTOCOL_VERSION, type: 'response_end' });
+            sendMsg(sock, { v: PROTOCOL_VERSION, type: 'inference_response_chunk', data: 'data: [DONE]' });
           }
-        } else if (msg['type'] === 'prompt_cancel' && sessionOpen) {
-          sendMsg(sock, { v: PROTOCOL_VERSION, type: 'prompt_cancelled' });
         } else if (msg['type'] === 'session_close') {
           sock.end();
         }
@@ -245,10 +244,79 @@ export async function startMockHost(): Promise<MockHost> {
 
 // ── Config builder ────────────────────────────────────────────────────────────
 
-export function makeConfig(router: MockRouter): { SHAREGRID_ROUTER_URL: string; SHAREGRID_LISTEN_PORT: number; SHAREGRID_MODE: 'server' | 'cli' } {
+export function makeConfig(
+  router: MockRouter,
+  listenPort = 3000,
+): { SHAREGRID_ROUTER_URL: string; SHAREGRID_LISTEN_PORT: number; SHAREGRID_MODE: 'server' | 'cli' } {
   return {
     SHAREGRID_ROUTER_URL: `https://127.0.0.1:${router.port}?fp=${router.fingerprint}&key=${router.userSecret}`,
-    SHAREGRID_LISTEN_PORT: 3000,
+    SHAREGRID_LISTEN_PORT: listenPort,
     SHAREGRID_MODE: 'server',
+  };
+}
+
+// ── Inference helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Send an inference_request via a live SessionClient and collect all
+ * inference_response_chunk.data lines until 'data: [DONE]' is received.
+ */
+export async function collectInference(client: SessionClient, body: string): Promise<string[]> {
+  const lines: string[] = [];
+  await client.sendInferenceRequest(
+    body,
+    (sseLine: string) => { lines.push(sseLine); },
+    new AbortController().signal,
+  );
+  return lines;
+}
+
+/**
+ * Extract concatenated delta.content from an array of raw SSE lines.
+ */
+export function extractContent(sseLines: string[]): string {
+  let content = '';
+  for (const line of sseLines) {
+    if (!line.startsWith('data: ')) continue;
+    const data = line.slice(6).trim();
+    if (data === '[DONE]') continue;
+    try {
+      const parsed = JSON.parse(data) as Record<string, unknown>;
+      const choices = parsed['choices'];
+      if (!Array.isArray(choices) || choices.length === 0) continue;
+      const delta = (choices[0] as Record<string, unknown>)['delta'];
+      if (typeof delta !== 'object' || delta === null) continue;
+      const c = (delta as Record<string, unknown>)['content'];
+      if (typeof c === 'string') content += c;
+    } catch { /* skip malformed */ }
+  }
+  return content;
+}
+
+// ── Full LLMUser server stack helper ──────────────────────────────────────────
+
+/**
+ * Start the complete LLMUser HTTP server stack against a mock router.
+ * Returns the bound port and a stop function.
+ */
+export async function startUserServer(
+  mockRouter: MockRouter,
+): Promise<{ port: number; stop(): Promise<void> }> {
+  const port = await getFreePort();
+  const config = makeConfig(mockRouter, port);
+
+  const routerClient = createRouterClient({ config, logger });
+  const modelRegistry = createModelRegistry({ routerClient });
+  const sessionPool = createHostSessionPool({ logger });
+  const apiServer = createApiServer({ config, modelRegistry, sessionPool, logger });
+
+  await apiServer.start();
+
+  return {
+    port,
+    async stop() {
+      await sessionPool.closeAll();
+      await apiServer.stop();
+    },
   };
 }

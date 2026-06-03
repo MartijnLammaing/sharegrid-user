@@ -41,7 +41,7 @@ function get(port: number, path: string): Promise<HttpResult> {
       let body = '';
       res.setEncoding('utf8');
       res.on('data', (c: string) => { body += c; });
-      res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers as Record<string, string | string[] | undefined>, body }));
+      res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body }));
     });
     req.on('error', reject);
     req.end();
@@ -63,7 +63,7 @@ function post(port: number, path: string, bodyObj: unknown): Promise<HttpResult>
         let body = '';
         res.setEncoding('utf8');
         res.on('data', (c: string) => { body += c; });
-        res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers as Record<string, string | string[] | undefined>, body }));
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body }));
       },
     );
     req.on('error', reject);

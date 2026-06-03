@@ -24,13 +24,11 @@ vi.mock('node:readline', () => ({
 describe('User integration — router unreachable', () => {
   let stderrLines: string[] = [];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let stderrSpy: any;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let exitSpy: any;
 
   beforeEach(() => {
     stderrLines = [];
-    stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation((data: unknown) => {
+    vi.spyOn(process.stderr, 'write').mockImplementation((data: unknown) => {
       stderrLines.push(String(data));
       return true;
     });

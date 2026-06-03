@@ -13,6 +13,8 @@ import {
   startMockRouter,
   startMockHost,
   makeConfig,
+  collectInference,
+  extractContent,
   logger,
   type MockRouter,
   type MockHost,
@@ -63,7 +65,23 @@ describe('User integration — happy path', () => {
     expect(closeMsg).toBeDefined();
   }, 10_000);
 
-  // sendInferenceRequest (Phase 2) integration test is in user Phase 10.
+  it('sendInferenceRequest streams SSE chunks and resolves on [DONE]', async () => {
+    mockHost.inferenceChunks = ['Hello', ' world'];
+
+    const config = makeConfig(mockRouter);
+    const routerClient = createRouterClient({ config, logger });
+    const hosts = await routerClient.fetchHostList();
+
+    const sessionClient = createSessionClient({ logger });
+    await sessionClient.openSession(hosts[0]!);
+
+    const sseLines = await collectInference(sessionClient, JSON.stringify({ model: 'test-model', messages: [] }));
+
+    expect(extractContent(sseLines)).toBe('Hello world');
+    expect(sseLines[sseLines.length - 1]).toBe('data: [DONE]');
+
+    await sessionClient.closeSession();
+  }, 10_000);
 
   it('router client closes the TLS connection after receiving the host list', async () => {
     const config = makeConfig(mockRouter);

@@ -10,8 +10,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import pino from 'pino';
-import { HostBusyError, InvalidTokenError, HostNotFoundError } from '@sharegrid/shared/errors';
-import { SessionTimeoutError } from '../../src/session-client.js';
+import { HostBusyError, HostNotFoundError, InvalidTokenError } from '@sharegrid/shared/errors';
 
 // ── Mock node:readline ────────────────────────────────────────────────────────
 
