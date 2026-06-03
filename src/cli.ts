@@ -29,6 +29,15 @@ import {
 } from './session-client.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
+// System prompt
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SYSTEM_PROMPT =
+  'Be direct and concise. Answer the question. Do not add unnecessary preamble, ' +
+  'caveats, filler, or repetition. Do not restate what was already said. ' +
+  'If the answer is short, keep it short.';
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Public types
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -143,7 +152,7 @@ export function createCli(deps: CliDeps): Cli {
       try {
         generationInFlight = true;
         await sessionClient.sendPrompt(
-          messages,
+          [{ role: 'system', content: SYSTEM_PROMPT }, ...messages],
           (chunk) => {
             accumulated += chunk;
             process.stdout.write(chunk);

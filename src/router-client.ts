@@ -14,7 +14,7 @@ import {
   parseFingerprintFromUrl,
   connectWithPinnedFingerprint,
 } from '@sharegrid/shared/tls';
-import { TlsFingerprintError } from '@sharegrid/shared/errors';
+import { TlsFingerprintError, RoleKeyMissingError } from '@sharegrid/shared/errors';
 import {
   PROTOCOL_VERSION,
   type HostListEntry,
@@ -59,7 +59,7 @@ export function createRouterClient(deps: RouterClientDeps): RouterClient {
 
   return {
     async fetchHostList(): Promise<HostListEntry[]> {
-      const { host, port, fingerprint } = parseFingerprintFromUrl(config.SHAREGRID_ROUTER_URL);
+      const { host, port, fingerprint, roleKey } = parseFingerprintFromUrl(config.SHAREGRID_ROUTER_URL);
 
       log.info({ host, port }, 'connecting to router');
 
@@ -138,11 +138,11 @@ export function createRouterClient(deps: RouterClientDeps): RouterClient {
         });
 
         // Send the request.
-        const request: HostListRequest = { v: PROTOCOL_VERSION, type: 'host_list_request' };
+        const request: HostListRequest = { v: PROTOCOL_VERSION, type: 'host_list_request', roleKey };
         sock.write(JSON.stringify(request) + '\n');
       });
     },
   };
 }
 
-export { TlsFingerprintError };
+export { TlsFingerprintError, RoleKeyMissingError };

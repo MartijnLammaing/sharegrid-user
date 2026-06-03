@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createRouterClient } from '../../src/router-client.js';
 import { createSessionClient } from '../../src/session-client.js';
 import { createCli } from '../../src/cli.js';
-import { logger } from './helpers.js';
+import { logger, startMockRouter } from './helpers.js';
 
 // ── Mock readline so the CLI doesn't block on stdin ───────────────────────────
 vi.mock('node:readline', () => ({
@@ -43,7 +43,7 @@ describe('User integration — router unreachable', () => {
 
   it('Router Client fails with a connection error when no router is running', async () => {
     const config = {
-      SHAREGRID_ROUTER_URL: 'https://127.0.0.1:19999?fp=sha256:' + 'a'.repeat(64),
+      SHAREGRID_ROUTER_URL: 'https://127.0.0.1:19999?fp=sha256:' + 'a'.repeat(64) + '&key=dummykey',
     };
 
     const routerClient = createRouterClient({ config, logger });
@@ -52,7 +52,7 @@ describe('User integration — router unreachable', () => {
 
   it('CLI exits with a non-zero code and prints an error when router is unreachable', async () => {
     const config = {
-      SHAREGRID_ROUTER_URL: 'https://127.0.0.1:19999?fp=sha256:' + 'a'.repeat(64),
+      SHAREGRID_ROUTER_URL: 'https://127.0.0.1:19999?fp=sha256:' + 'a'.repeat(64) + '&key=dummykey',
     };
 
     const routerClient = createRouterClient({ config, logger });
@@ -76,4 +76,35 @@ describe('User integration — router unreachable', () => {
     );
     expect(stderrHasError).toBe(true);
   }, 10_000);
+
+  // ── Phase 9 (9-4): Wrong roleKey causes rejection ─────────────────────────
+
+  it('CLI exits with an error when router rejects the user access key', async () => {
+    // Start a real mock router — it will reject any key other than its userSecret
+    const mockRouter = await startMockRouter([]);
+    const wrongKeyConfig = {
+      SHAREGRID_ROUTER_URL: `https://127.0.0.1:${mockRouter.port}?fp=${mockRouter.fingerprint}&key=completely-wrong-key`,
+    };
+
+    const routerClient = createRouterClient({ config: wrongKeyConfig, logger });
+    const sessionClient = createSessionClient({ logger });
+    const cli = createCli({ routerClient, sessionClient, logger });
+
+    try {
+      await cli.run();
+    } catch {
+      // process.exit mocked as no-op; subsequent code may throw
+    }
+
+    mockRouter.stop();
+
+    // process.exit(1) must have been called
+    expect(exitSpy).toHaveBeenCalledWith(1);
+
+    // stderr or stdout must contain an error indication
+    const hasError = stderrLines.some(
+      (l) => l.toLowerCase().includes('error') || l.toLowerCase().includes('connect'),
+    );
+    expect(hasError).toBe(true);
+  }, 15_000);
 });

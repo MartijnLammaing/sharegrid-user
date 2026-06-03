@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { TlsFingerprintError } from '@sharegrid/shared/errors';
+import { TlsFingerprintError, RoleKeyMissingError } from '@sharegrid/shared/errors';
 import { PROTOCOL_VERSION } from '@sharegrid/shared/protocol';
 import pino from 'pino';
 
@@ -38,7 +38,7 @@ class MockSocket extends EventEmitter {
 }
 
 const logger = pino({ level: 'silent' });
-const validUrl = 'https://router.example.com:8443?fp=sha256:' + 'a'.repeat(64);
+const validUrl = 'https://router.example.com:8443?fp=sha256:' + 'a'.repeat(64) + '&key=testUserSecret';
 const config = { SHAREGRID_ROUTER_URL: validUrl };
 
 describe('RouterClient (user)', () => {
@@ -49,7 +49,7 @@ describe('RouterClient (user)', () => {
     vi.restoreAllMocks();
   });
 
-  it('sends HostListRequest with correct v and type', async () => {
+  it('sends HostListRequest with correct v, type, and roleKey', async () => {
     const sock = new MockSocket();
     mockConnect.mockResolvedValueOnce(sock);
 
@@ -61,10 +61,20 @@ describe('RouterClient (user)', () => {
     const sent = JSON.parse(sock.written[0]!.trim()) as Record<string, unknown>;
     expect(sent['v']).toBe(PROTOCOL_VERSION);
     expect(sent['type']).toBe('host_list_request');
+    expect(sent['roleKey']).toBe('testUserSecret');
 
     // Now inject response
     sock.inject({ v: PROTOCOL_VERSION, type: 'host_list_response', hosts: [] });
     await fetchPromise;
+  });
+
+  it('propagates RoleKeyMissingError when URL lacks key param', async () => {
+    const noKeyConfig = { SHAREGRID_ROUTER_URL: 'https://router.example.com:8443?fp=sha256:' + 'a'.repeat(64) };
+    const client = createRouterClient({ config: noKeyConfig, logger });
+    const err = await client.fetchHostList().catch((e: unknown) => e);
+    expect(err).toMatchObject({ code: 'ROLE_KEY_MISSING' });
+    // connectWithPinnedFingerprint must NOT have been called — error is pre-connect
+    expect(mockConnect).not.toHaveBeenCalled();
   });
 
   it('parses HostListResponse and returns the hosts array', async () => {

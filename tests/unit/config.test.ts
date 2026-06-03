@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MockInstance } from '@vitest/spy';
 
-const validUrl = 'tls://router.example.com:8443?fp=sha256:' + 'a'.repeat(64);
+const validUrl = 'https://router.example.com:8443?fp=sha256:' + 'a'.repeat(64) + '&key=testUserKey123';
 
 describe('loadConfig', () => {
   let exitSpy: MockInstance<(code?: number) => never>;
@@ -44,15 +44,27 @@ describe('loadConfig', () => {
   });
 
   it('exits with code 1 when SHAREGRID_ROUTER_URL lacks fp query param', async () => {
-    process.env['SHAREGRID_ROUTER_URL'] = 'tls://router.example.com:8443';
+    process.env['SHAREGRID_ROUTER_URL'] = 'https://router.example.com:8443?key=testUserKey123';
     await expect(load()).rejects.toThrow('process.exit called');
     expect(exitSpy).toHaveBeenCalledWith(1);
   });
 
   it('exits with code 1 when fp value has wrong prefix (not sha256:)', async () => {
     process.env['SHAREGRID_ROUTER_URL'] =
-      'tls://router.example.com:8443?fp=md5:' + 'a'.repeat(64);
+      'https://router.example.com:8443?fp=md5:' + 'a'.repeat(64) + '&key=testUserKey123';
     await expect(load()).rejects.toThrow('process.exit called');
     expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('exits with code 1 when SHAREGRID_ROUTER_URL has fp but no key query param', async () => {
+    process.env['SHAREGRID_ROUTER_URL'] = 'https://router.example.com:8443?fp=sha256:' + 'a'.repeat(64);
+    await expect(load()).rejects.toThrow('process.exit called');
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('parses correctly when SHAREGRID_ROUTER_URL has both fp and key params', async () => {
+    process.env['SHAREGRID_ROUTER_URL'] = validUrl;
+    const config = await load();
+    expect(config.SHAREGRID_ROUTER_URL).toContain('key=testUserKey123');
   });
 });

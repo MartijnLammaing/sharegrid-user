@@ -73,12 +73,15 @@ export interface MockRouter {
   fingerprint: string;
   /** The host list that will be returned on HostListRequest */
   hosts: HostListEntry[];
+  /** User access secret — must match the `roleKey` in HostListRequest. */
+  userSecret: string;
   stop(): void;
 }
 
-export async function startMockRouter(hosts: HostListEntry[]): Promise<MockRouter> {
+export async function startMockRouter(hosts: HostListEntry[], userSecret?: string): Promise<MockRouter> {
   const { cert, key, fingerprint } = generateCert();
   const port = await getFreePort();
+  const secret = userSecret ?? `mock-user-secret-${Date.now()}`;
 
   const server = createTlsServer({ cert, key }, (sock: TLSSocket) => {
     let buf = '';
@@ -92,6 +95,11 @@ export async function startMockRouter(hosts: HostListEntry[]): Promise<MockRoute
         if (!line) continue;
         const msg = JSON.parse(line) as Record<string, unknown>;
         if (msg['type'] === 'host_list_request') {
+          // Validate roleKey — reject if missing or wrong
+          if (msg['roleKey'] !== secret) {
+            sock.destroy();
+            return;
+          }
           sendMsg(sock, { v: PROTOCOL_VERSION, type: 'host_list_response', hosts });
           sock.end();
         }
@@ -109,6 +117,7 @@ export async function startMockRouter(hosts: HostListEntry[]): Promise<MockRoute
     port,
     fingerprint,
     hosts,
+    userSecret: secret,
     stop() { server.close(); },
   };
 }
@@ -238,6 +247,6 @@ export async function startMockHost(): Promise<MockHost> {
 
 export function makeConfig(router: MockRouter): { SHAREGRID_ROUTER_URL: string } {
   return {
-    SHAREGRID_ROUTER_URL: `https://127.0.0.1:${router.port}?fp=${router.fingerprint}`,
+    SHAREGRID_ROUTER_URL: `https://127.0.0.1:${router.port}?fp=${router.fingerprint}&key=${router.userSecret}`,
   };
 }
