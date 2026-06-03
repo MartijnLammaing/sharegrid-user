@@ -5,14 +5,11 @@
  *  - Open a TLS connection pinned to the host's cert fingerprint.
  *  - Present the host key token to open a session (session_open → session_ack).
  *  - Send InferenceRequestPayload messages and stream InferenceResponseChunk
- *    messages back to the caller.
+ *    messages back to the caller via sendInferenceRequest.
  *  - Keep the session open between inference turns (persistent session model).
  *  - Handle host-initiated termination (SessionTimeout, SessionClose).
  *  - Expose abort() to destroy the socket (signals the host to cancel).
  *  - Close the connection cleanly on user exit.
- *
- * The full Phase 2 sendInferenceRequest implementation is in user Phase 2 of
- * the implementation plan. This file contains the Phase 0 stub.
  *
  * See: docs/architecture_llmuser.md §2.4
  *      docs/implementation_plan_llmuser.md Phase 2
@@ -34,6 +31,7 @@ import {
   type SessionOpenPayload,
   type SessionAck,
   type SessionReject,
+  type InferenceRequestPayload,
   type SessionClose,
   type SessionTimeout,
   type UserFromHostMessage,
@@ -77,10 +75,12 @@ export interface SessionClient {
    *
    * Sends an `inference_request` message carrying the JSON-serialised OpenAI
    * request body. Calls `onChunk` for each received `inference_response_chunk`
-   * data field. Resolves when `data: [DONE]` is received or the request is
-   * aborted via the provided `signal`.
+   * data field. Resolves when `data: [DONE]` is received, when the host sends
+   * `session_close`, or when the socket closes (e.g. after `abort()`).
+   * Rejects with `SessionTimeoutError` on `session_timeout`.
    *
-   * Implemented in Phase 2 user task 2-1.
+   * If `signal` fires, `abort()` is called automatically, which destroys the
+   * socket — the host detects this and cancels the inference.
    */
   sendInferenceRequest(
     body: string,
@@ -119,6 +119,28 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
   // ── Mutable connection state ──────────────────────────────────────────────
   let sock: TLSSocket | null = null;
   let sessionActive = false;
+
+  // ── Active inference tracking ─────────────────────────────────────────────
+  // Set for the duration of a sendInferenceRequest call; cleared on settlement.
+  let activeInferenceResolve: (() => void) | null = null;
+  let activeInferenceReject: ((err: Error) => void) | null = null;
+  let activeOnChunk: ((sseLine: string) => void) | null = null;
+
+  function resolveActiveInference(): void {
+    const r = activeInferenceResolve;
+    activeInferenceResolve = null;
+    activeInferenceReject = null;
+    activeOnChunk = null;
+    r?.();
+  }
+
+  function rejectActiveInference(err: Error): void {
+    const r = activeInferenceReject;
+    activeInferenceResolve = null;
+    activeInferenceReject = null;
+    activeOnChunk = null;
+    r?.(err);
+  }
 
   // ── NDJSON framing ────────────────────────────────────────────────────────
 
@@ -168,6 +190,9 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
         sessionActive = false;
         if (!handshakeDone) {
           reject(new Error('host closed connection before session ack'));
+        } else {
+          // Settle any in-flight sendInferenceRequest (abort or unexpected close).
+          resolveActiveInference();
         }
       });
 
@@ -177,6 +202,7 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
           sock?.destroy();
           const err = new Error('host message exceeded 1 MiB');
           if (!handshakeDone) reject(err);
+          else rejectActiveInference(err);
           return;
         }
 
@@ -192,6 +218,7 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
           } catch {
             const err = new Error('host sent non-JSON message');
             if (!handshakeDone) reject(err);
+            else rejectActiveInference(err);
             return;
           }
 
@@ -202,6 +229,7 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
           ) {
             const err = new ProtocolVersionError();
             if (!handshakeDone) reject(err);
+            else rejectActiveInference(err);
             return;
           }
 
@@ -271,16 +299,22 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
 
   function handleSessionMessage(msg: UserFromHostMessage): void {
     switch (msg.type) {
-      case 'inference_response_chunk':
-        // Phase 2 implementation: route to active sendInferenceRequest call.
-        log.debug({ data: msg.data }, 'inference_response_chunk (stub — not yet routed)');
+      case 'inference_response_chunk': {
+        // Route each raw SSE line to the active sendInferenceRequest call.
+        activeOnChunk?.(msg.data);
+        // The [DONE] line signals end of this inference turn.
+        if (msg.data === 'data: [DONE]') {
+          resolveActiveInference();
+        }
         break;
+      }
       case 'session_timeout': {
         const _t: SessionTimeout = msg;
         void _t;
         log.info('session timed out by host');
         sessionActive = false;
         sock?.destroy();
+        rejectActiveInference(new SessionTimeoutError());
         break;
       }
       case 'session_close': {
@@ -289,6 +323,7 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
         log.info('host initiated session close');
         sessionActive = false;
         sock?.destroy();
+        resolveActiveInference();
         break;
       }
       case 'session_ack':
@@ -300,14 +335,34 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
     }
   }
 
-  // ── sendInferenceRequest (Phase 2 stub) ───────────────────────────────────
+  // ── sendInferenceRequest ──────────────────────────────────────────────────
 
   async function sendInferenceRequest(
-    _body: string,
-    _onChunk: (sseLine: string) => void,
-    _signal: AbortSignal,
+    body: string,
+    onChunk: (sseLine: string) => void,
+    signal: AbortSignal,
   ): Promise<void> {
-    throw new Error('not implemented');
+    if (!sessionActive || sock === null) {
+      throw new Error('session is not open');
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      activeInferenceResolve = resolve;
+      activeInferenceReject = reject;
+      activeOnChunk = onChunk;
+
+      // When the caller's signal fires (e.g. HTTP client disconnects), destroy
+      // the socket. The host detects the close and cancels inference. The close
+      // handler calls resolveActiveInference(), settling this promise.
+      signal.addEventListener('abort', () => { abort(); }, { once: true });
+
+      const payload: InferenceRequestPayload = {
+        v: PROTOCOL_VERSION,
+        type: 'inference_request',
+        body,
+      };
+      writeMessage(payload);
+    });
   }
 
   // ── abort ─────────────────────────────────────────────────────────────────

@@ -22,8 +22,8 @@ class MockSocket extends EventEmitter {
 
   setEncoding(_enc: string) { return this; }
   write(data: string) { this.written.push(data); return true; }
-  end(cb?: () => void) { this.destroyed = true; cb?.(); return this; }
-  destroy() { this.destroyed = true; return this; }
+  end(cb?: () => void) { this.destroyed = true; cb?.(); setImmediate(() => this.emit('close')); return this; }
+  destroy() { this.destroyed = true; setImmediate(() => this.emit('close')); return this; }
   override removeListener(event: string, fn: (...args: unknown[]) => void) {
     super.removeListener(event, fn);
     return this;
@@ -156,8 +156,10 @@ describe('SessionClient', () => {
     });
   });
 
-  describe('sendInferenceRequest (stub)', () => {
-    it('throws "not implemented" — Phase 2 implementation pending', async () => {
+  // ─── Phase 2: sendInferenceRequest ─────────────────────────────────────────
+
+  describe('sendInferenceRequest', () => {
+    async function openedClient() {
       const sock = new MockSocket();
       mockConnect.mockResolvedValueOnce(sock);
       const client = createSessionClient({ logger });
@@ -165,10 +167,138 @@ describe('SessionClient', () => {
       await new Promise((r) => setTimeout(r, 0));
       sock.inject({ v: PROTOCOL_VERSION, type: 'session_ack' });
       await openPromise;
+      return { client, sock };
+    }
 
+    it('sends inference_request with the correct body', async () => {
+      const { client, sock } = await openedClient();
+      const body = '{"messages":[],"stream":true}';
+
+      // Don't await — we'll settle it ourselves
+      const promise = client.sendInferenceRequest(body, vi.fn(), new AbortController().signal);
+      await new Promise((r) => setTimeout(r, 0));
+
+      const msgs = sock.messages();
+      const req = msgs.find((m) => m['type'] === 'inference_request')!;
+      expect(req).toBeDefined();
+      expect(req['body']).toBe(body);
+
+      // Settle by injecting [DONE]
+      sock.inject({ v: PROTOCOL_VERSION, type: 'inference_response_chunk', data: 'data: [DONE]' });
+      await promise;
+    });
+
+    it('calls onChunk for each inference_response_chunk.data', async () => {
+      const { client, sock } = await openedClient();
+      const chunks: string[] = [];
+
+      const promise = client.sendInferenceRequest('{}', (line) => chunks.push(line), new AbortController().signal);
+      await new Promise((r) => setTimeout(r, 0));
+
+      sock.inject({ v: PROTOCOL_VERSION, type: 'inference_response_chunk', data: 'data: hello' });
+      sock.inject({ v: PROTOCOL_VERSION, type: 'inference_response_chunk', data: 'data: world' });
+      sock.inject({ v: PROTOCOL_VERSION, type: 'inference_response_chunk', data: 'data: [DONE]' });
+      await promise;
+
+      expect(chunks).toEqual(['data: hello', 'data: world', 'data: [DONE]']);
+    });
+
+    it('resolves when data: [DONE] chunk is received', async () => {
+      const { client, sock } = await openedClient();
+
+      const promise = client.sendInferenceRequest('{}', vi.fn(), new AbortController().signal);
+      await new Promise((r) => setTimeout(r, 0));
+      sock.inject({ v: PROTOCOL_VERSION, type: 'inference_response_chunk', data: 'data: [DONE]' });
+
+      await expect(promise).resolves.toBeUndefined();
+    });
+
+    it('does not resolve before [DONE] is received', async () => {
+      const { client, sock } = await openedClient();
+
+      let settled = false;
+      const promise = client.sendInferenceRequest('{}', vi.fn(), new AbortController().signal);
+      promise.then(() => { settled = true; }).catch(() => { settled = true; });
+
+      await new Promise((r) => setTimeout(r, 0));
+      sock.inject({ v: PROTOCOL_VERSION, type: 'inference_response_chunk', data: 'data: partial' });
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(settled).toBe(false);
+
+      // Settle
+      sock.inject({ v: PROTOCOL_VERSION, type: 'inference_response_chunk', data: 'data: [DONE]' });
+      await promise;
+    });
+
+    it('resolves cleanly when abort() is called mid-inference', async () => {
+      const { client } = await openedClient();
+
+      const promise = client.sendInferenceRequest('{}', vi.fn(), new AbortController().signal);
+      await new Promise((r) => setTimeout(r, 0));
+
+      client.abort();
+
+      await expect(promise).resolves.toBeUndefined();
+    });
+
+    it('signal.abort calls abort() which destroys socket and resolves promise', async () => {
+      const { client, sock } = await openedClient();
+
+      const controller = new AbortController();
+      const promise = client.sendInferenceRequest('{}', vi.fn(), controller.signal);
+      await new Promise((r) => setTimeout(r, 0));
+
+      controller.abort();
+      await new Promise((r) => setTimeout(r, 0));
+
+      await expect(promise).resolves.toBeUndefined();
+      expect(sock.destroyed).toBe(true);
+      expect(client.isAlive()).toBe(false);
+    });
+
+    it('rejects with SessionTimeoutError on session_timeout', async () => {
+      const { client, sock } = await openedClient();
+
+      const promise = client.sendInferenceRequest('{}', vi.fn(), new AbortController().signal);
+      await new Promise((r) => setTimeout(r, 0));
+      sock.inject({ v: PROTOCOL_VERSION, type: 'session_timeout' });
+
+      await expect(promise).rejects.toThrow(SessionTimeoutError);
+    });
+
+    it('resolves cleanly on host-initiated session_close', async () => {
+      const { client, sock } = await openedClient();
+
+      const promise = client.sendInferenceRequest('{}', vi.fn(), new AbortController().signal);
+      await new Promise((r) => setTimeout(r, 0));
+      sock.inject({ v: PROTOCOL_VERSION, type: 'session_close' });
+
+      await expect(promise).resolves.toBeUndefined();
+    });
+
+    it('stale inference_response_chunk after [DONE] is a no-op', async () => {
+      const { client, sock } = await openedClient();
+      const chunks: string[] = [];
+
+      const promise = client.sendInferenceRequest('{}', (line) => chunks.push(line), new AbortController().signal);
+      await new Promise((r) => setTimeout(r, 0));
+      sock.inject({ v: PROTOCOL_VERSION, type: 'inference_response_chunk', data: 'data: [DONE]' });
+      await promise;
+
+      const countBefore = chunks.length;
+      // Inject a late chunk — should be a no-op
+      sock.inject({ v: PROTOCOL_VERSION, type: 'inference_response_chunk', data: 'data: stale' });
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(chunks.length).toBe(countBefore);
+    });
+
+    it('throws "session is not open" when called before openSession', async () => {
+      const client = createSessionClient({ logger });
       await expect(
         client.sendInferenceRequest('{}', vi.fn(), new AbortController().signal),
-      ).rejects.toThrow('not implemented');
+      ).rejects.toThrow('session is not open');
     });
   });
 });
