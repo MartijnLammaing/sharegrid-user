@@ -29,9 +29,18 @@ RUN npm run build
 # =============================================================================
 # Stage 2 — Runtime
 #
-# The LLMUser is an interactive CLI. It MUST be run with `docker run -it`
-# to attach a TTY — without one, readline has no terminal to prompt and the
-# process exits immediately.
+# Two operating modes, selected via the SHAREGRID_MODE environment variable:
+#
+#   Server mode (default — OpenCode provider adapter):
+#     docker run -d -p 3000:3000 \
+#       -e SHAREGRID_ROUTER_URL="https://..." \
+#       sharegrid-user
+#
+#   CLI mode (standalone interactive terminal, requires a TTY):
+#     docker run -it \
+#       -e SHAREGRID_MODE=cli \
+#       -e SHAREGRID_ROUTER_URL="https://..." \
+#       sharegrid-user
 # =============================================================================
 FROM node:22-slim AS runtime
 
@@ -42,6 +51,9 @@ RUN groupadd --gid 1001 sharegrid \
 WORKDIR /app
 
 ENV NODE_ENV=production
+
+# Port published by the HTTP server in server mode.
+EXPOSE 3000
 
 COPY --from=builder /app/dist/bundle.cjs /app/bundle.cjs
 

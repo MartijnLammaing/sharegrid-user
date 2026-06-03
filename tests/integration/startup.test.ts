@@ -7,7 +7,8 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createRouterClient } from '../../src/router-client.js';
-import { createSessionClient } from '../../src/session-client.js';
+import { createModelRegistry } from '../../src/model-registry.js';
+import { createHostSessionPool } from '../../src/host-session-pool.js';
 import { createCli } from '../../src/cli.js';
 import { logger, startMockRouter } from './helpers.js';
 
@@ -57,8 +58,9 @@ describe('User integration — router unreachable', () => {
     };
 
     const routerClient = createRouterClient({ config, logger });
-    const sessionClient = createSessionClient({ logger });
-    const cli = createCli({ routerClient, sessionClient, logger });
+    const modelRegistry = createModelRegistry({ routerClient });
+    const sessionPool = createHostSessionPool({ logger });
+    const cli = createCli({ modelRegistry, sessionPool, logger });
 
     // process.exit is mocked to not throw/exit, so run() may throw after the
     // exit call due to uninitialized state — that's expected; catch and ignore.
@@ -90,8 +92,9 @@ describe('User integration — router unreachable', () => {
     };
 
     const routerClient = createRouterClient({ config: wrongKeyConfig, logger });
-    const sessionClient = createSessionClient({ logger });
-    const cli = createCli({ routerClient, sessionClient, logger });
+    const modelRegistry = createModelRegistry({ routerClient });
+    const sessionPool = createHostSessionPool({ logger });
+    const cli = createCli({ modelRegistry, sessionPool, logger });
 
     try {
       await cli.run();

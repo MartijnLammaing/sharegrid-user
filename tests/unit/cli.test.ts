@@ -1,19 +1,17 @@
 /**
- * CLI unit tests.
+ * CLI unit tests — Phase 6.
  *
- * Phase 2 note: the conversation loop (sendInferenceRequest + SSE parsing) is
- * being implemented in user Phase 6. Tests for the inference path, SIGINT
- * during generation, and session timeout handling are written in user Phase 9
- * of the implementation plan once the full CLI is in place.
- *
- * This file contains only tests for behaviour that terminates without entering
- * the conversation loop: host list rendering, empty list handling, and session
- * open errors that cause an immediate reselect/refetch.
+ * Strategy: mock ModelRegistry, HostSessionPool, and the SessionClient
+ * returned by acquire(). Drive readline via queued answers. Each test is
+ * designed to terminate naturally by having getModels() return [] on the
+ * second call (or by having the conversation loop return an action that
+ * loops back to an empty model list).
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import pino from 'pino';
-import { HostBusyError, InvalidTokenError } from '@sharegrid/shared/errors';
+import { HostBusyError, InvalidTokenError, HostNotFoundError } from '@sharegrid/shared/errors';
+import { SessionTimeoutError } from '../../src/session-client.js';
 
 // ── Mock node:readline ────────────────────────────────────────────────────────
 
@@ -34,19 +32,27 @@ vi.mock('node:readline', () => ({
 
 import { createCli } from '../../src/cli.js';
 
+// ─────────────────────────────────────────────────────────────────────────────
+
 const logger = pino({ level: 'silent' });
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Fixtures ──────────────────────────────────────────────────────────────────
 
-function makeHosts(count = 2) {
-  return Array.from({ length: count }, (_, i) => ({
+function makeModels(ids = ['model-0', 'model-1']) {
+  return ids.map((id) => ({ id, object: 'model' as const, owned_by: 'sharegrid' }));
+}
+
+function makeHosts(ids = ['model-0', 'model-1']) {
+  return ids.map((id, i) => ({
     hostId: `host-${i}`,
-    modelName: `model-${i}`,
+    modelName: id,
     endpoint: `10.0.0.${i}:9000`,
-    tlsFingerprint: 'sha256:' + '0'.repeat(63) + String(i),
-    hostKeyToken: `token-${i}`,
+    tlsFingerprint: 'sha256:' + 'a'.repeat(64),
+    hostKeyToken: `tok-${i}`,
   }));
 }
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
  * Drive readline questions from a queue. When exhausted, always returns the
@@ -62,42 +68,59 @@ function queueAnswers(answers: string[]) {
 }
 
 /**
- * A router client that returns `hosts` on the first call and [] on all
- * subsequent calls, so the CLI terminates naturally after the first refetch.
+ * A ModelRegistry that returns `models` on the first call and [] on subsequent
+ * calls, so the outer run() loop terminates naturally.
  */
-function makeRouterClient(hosts = makeHosts()) {
+function makeModelRegistry(models = makeModels(), hosts = makeHosts()) {
   let calls = 0;
   return {
-    fetchHostList: vi.fn().mockImplementation(() =>
-      Promise.resolve(calls++ === 0 ? hosts : []),
+    getModels: vi.fn().mockImplementation(() =>
+      Promise.resolve(calls++ === 0 ? models : []),
     ),
+    resolveHost: vi.fn().mockImplementation((id: string) => {
+      const host = hosts.find((h) => h.modelName === id);
+      if (!host) return Promise.reject(new HostNotFoundError(`no host for '${id}'`));
+      return Promise.resolve(host);
+    }),
+  };
+}
+
+/** A mock SessionClient returned by acquire(). */
+function makeMockSession(opts: {
+  sendResult?: Error | 'resolve';
+} = {}) {
+  return {
+    openSession: vi.fn().mockResolvedValue(undefined),
+    sendInferenceRequest: vi.fn().mockImplementation(
+      (_body: string, _onChunk: unknown, _signal: AbortSignal): Promise<void> => {
+        if (opts.sendResult instanceof Error) return Promise.reject(opts.sendResult);
+        return Promise.resolve();
+      },
+    ),
+    abort: vi.fn(),
+    isAlive: vi.fn().mockReturnValue(true),
+    closeSession: vi.fn().mockResolvedValue(undefined),
   };
 }
 
 /**
- * A mock SessionClient with the Phase 2 interface.
- * `openSessionResults` controls the sequence of openSession outcomes.
- * When exhausted, openSession rejects with InvalidTokenError which causes
- * the CLI to refetch (and get an empty list → exit).
+ * A HostSessionPool where acquire() returns a controllable mock session.
+ * `acquireError` makes the first acquire() reject.
  */
-function makeSessionClient(opts: {
-  openSessionResults?: Array<'ok' | Error>;
+function makeSessionPool(opts: {
+  acquireError?: Error;
+  session?: ReturnType<typeof makeMockSession>;
 } = {}) {
-  const opens = opts.openSessionResults ?? ['ok'];
-  let openIdx = 0;
-  let alive = false;
-
+  const session = opts.session ?? makeMockSession();
+  let acquireCount = 0;
   return {
-    openSession: vi.fn().mockImplementation((): Promise<void> => {
-      const result = opens[openIdx++] ?? new InvalidTokenError();
-      if (result instanceof Error) return Promise.reject(result);
-      alive = true;
-      return Promise.resolve();
+    acquire: vi.fn().mockImplementation(() => {
+      acquireCount++;
+      if (opts.acquireError && acquireCount === 1) return Promise.reject(opts.acquireError);
+      return Promise.resolve(session);
     }),
-    sendInferenceRequest: vi.fn().mockResolvedValue(undefined),
-    abort: vi.fn().mockImplementation(() => { alive = false; }),
-    isAlive: vi.fn().mockImplementation(() => alive),
-    closeSession: vi.fn().mockResolvedValue(undefined),
+    closeAll: vi.fn().mockResolvedValue(undefined),
+    _session: session,
   };
 }
 
@@ -120,66 +143,130 @@ describe('CLI', () => {
     vi.restoreAllMocks();
   });
 
-  // ── Empty host list ───────────────────────────────────────────────────────
+  // ── Empty model list ────────────────────────────────────────────────────────
 
-  it('prints a clear message and returns when the host list is empty', async () => {
-    const rc = { fetchHostList: vi.fn().mockResolvedValue([]) };
-    const sc = makeSessionClient();
+  it('prints a clear message and exits when model list is empty', async () => {
+    const registry = { getModels: vi.fn().mockResolvedValue([]), resolveHost: vi.fn() };
+    const pool = makeSessionPool();
     queueAnswers([]);
 
-    await createCli({ routerClient: rc, sessionClient: sc, logger }).run();
+    await createCli({ modelRegistry: registry, sessionPool: pool, logger }).run();
 
     expect(stdoutOutput.toLowerCase()).toContain('no hosts');
   });
 
-  // ── Host list rendering ───────────────────────────────────────────────────
-  //
-  // The host list is rendered before openSession is called, so we can verify
-  // rendering by having openSession fail immediately (no conversation loop).
+  // ── Model list rendering ────────────────────────────────────────────────────
 
-  it('renders all hosts with correct 1-based numbering', async () => {
-    const hosts = makeHosts(3);
-    const rc = makeRouterClient(hosts);
-    // First open: HostBusyError → reselect → host list rendered again
-    // Second open (fallback InvalidTokenError) → refetch → [] → exit
-    const sc = makeSessionClient({ openSessionResults: [new HostBusyError()] });
-    queueAnswers(['1', '1']); // select 1 twice
+  it('renders all models with correct 1-based numbering', async () => {
+    const registry = makeModelRegistry(makeModels(['alpha', 'beta', 'gamma']));
+    // HostBusyError on first acquire → 'reselect' → getModels() → [] → exit
+    const pool = makeSessionPool({ acquireError: new HostBusyError() });
+    queueAnswers(['1', '1']); // select model twice
 
-    await createCli({ routerClient: rc, sessionClient: sc, logger }).run();
+    await createCli({ modelRegistry: registry, sessionPool: pool, logger }).run();
 
     expect(stdoutOutput).toContain('[1]');
     expect(stdoutOutput).toContain('[2]');
     expect(stdoutOutput).toContain('[3]');
-    expect(stdoutOutput).toContain('model-0');
-    expect(stdoutOutput).toContain('model-1');
-    expect(stdoutOutput).toContain('model-2');
+    expect(stdoutOutput).toContain('alpha');
+    expect(stdoutOutput).toContain('beta');
+    expect(stdoutOutput).toContain('gamma');
   });
 
-  // ── Session open errors ───────────────────────────────────────────────────
+  // ── Session open errors ─────────────────────────────────────────────────────
 
-  it('host busy: informs user and returns to host list', async () => {
-    const rc = makeRouterClient();
-    // HostBusyError → reselect. Next call (fallback) → InvalidTokenError → refetch → [] → exit.
-    const sc = makeSessionClient({ openSessionResults: [new HostBusyError()] });
+  it('host busy: informs user and returns to model list', async () => {
+    const registry = makeModelRegistry();
+    const pool = makeSessionPool({ acquireError: new HostBusyError() });
     queueAnswers(['1', '1']);
 
-    await createCli({ routerClient: rc, sessionClient: sc, logger }).run();
+    await createCli({ modelRegistry: registry, sessionPool: pool, logger }).run();
 
     expect(stdoutOutput.toLowerCase()).toContain('busy');
   });
 
-  it('invalid token: re-fetches host list', async () => {
-    const rc = makeRouterClient();
-    const sc = makeSessionClient({ openSessionResults: [new InvalidTokenError()] });
+  it('invalid token: re-fetches model list', async () => {
+    const registry = makeModelRegistry();
+    const pool = makeSessionPool({ acquireError: new InvalidTokenError() });
     queueAnswers(['1', '1']);
 
-    await createCli({ routerClient: rc, sessionClient: sc, logger }).run();
+    await createCli({ modelRegistry: registry, sessionPool: pool, logger }).run();
 
-    // fetchHostList called twice: initial fetch + refetch
-    expect(rc.fetchHostList).toHaveBeenCalledTimes(2);
+    // getModels called twice: initial + after refetch action
+    expect(registry.getModels).toHaveBeenCalledTimes(2);
   });
 
-  // Conversation-loop tests (session timeout, Ctrl+C, chunk streaming) are
-  // written in user Phase 9 once the full sendInferenceRequest + SSE parsing
-  // implementation is in place.
+  // ── SSE content display ─────────────────────────────────────────────────────
+
+  it('delta.content chunks from SSE lines are written to stdout', async () => {
+    const session = makeMockSession();
+    session.sendInferenceRequest.mockImplementation(
+      (_body: string, onChunk: (line: string) => void) => {
+        onChunk('data: {"choices":[{"delta":{"content":"hello"}}]}');
+        onChunk('data: {"choices":[{"delta":{"content":" world"}}]}');
+        onChunk('data: [DONE]');
+        return Promise.resolve();
+      },
+    );
+
+    const registry = makeModelRegistry();
+    const pool = makeSessionPool({ session });
+    // After one turn → sendInferenceRequest resolves → next prompt → acquire
+    // throws InvalidTokenError → refetch → [] → exit
+    pool.acquire
+      .mockResolvedValueOnce(session)
+      .mockRejectedValueOnce(new InvalidTokenError());
+
+    queueAnswers(['1', 'hi', '1']);
+
+    await createCli({ modelRegistry: registry, sessionPool: pool, logger }).run();
+
+    expect(stdoutOutput).toContain('hello');
+    expect(stdoutOutput).toContain(' world');
+  });
+
+  // ── Ctrl+C during generation ────────────────────────────────────────────────
+
+  it('Ctrl+C during generation aborts the controller and prints [stopped]', async () => {
+    const session = makeMockSession();
+    session.sendInferenceRequest.mockImplementation(
+      (_body: string, _onChunk: unknown, signal: AbortSignal): Promise<void> => {
+        return new Promise<void>((resolve) => {
+          signal.addEventListener('abort', () => resolve(), { once: true });
+        });
+      },
+    );
+
+    const registry = makeModelRegistry();
+    const pool = makeSessionPool({ session });
+
+    let inputCallCount = 0;
+    (mockRl.question as ReturnType<typeof vi.fn>).mockImplementation(
+      (_q: string, cb: QuestionCallback) => {
+        inputCallCount++;
+        if (inputCallCount === 1) {
+          // Model selection
+          setTimeout(() => cb('1'), 0);
+        } else if (inputCallCount === 2) {
+          // First user prompt — after answering, schedule Ctrl+C
+          setTimeout(() => {
+            cb('hello');
+            setTimeout(() => {
+              // Queue next acquire to fail so the loop terminates after [stopped]
+              pool.acquire.mockRejectedValueOnce(new InvalidTokenError());
+              process.emit('SIGINT');
+            }, 20);
+          }, 0);
+        } else {
+          // After [stopped] the loop continues; this non-empty answer triggers
+          // the queued InvalidTokenError from acquire → 'refetch' → [] → exit
+          setTimeout(() => cb('bye'), 0);
+        }
+      },
+    );
+
+    await createCli({ modelRegistry: registry, sessionPool: pool, logger }).run();
+
+    expect(stdoutOutput).toContain('[stopped]');
+  }, 10_000);
 });
