@@ -5,13 +5,13 @@ import { HostBusyError, InvalidTokenError, NotRegisteredError, ProtocolVersionEr
 import pino from 'pino';
 
 // ── Mock @sharegrid/shared/tls ────────────────────────────────────────────────
-const mockConnect = vi.fn();
+const { mockConnect } = vi.hoisted(() => ({ mockConnect: vi.fn() }));
 vi.mock('@sharegrid/shared/tls', async (importOriginal) => {
   const real = await importOriginal<typeof import('@sharegrid/shared/tls')>();
   return { ...real, connectWithPinnedFingerprint: mockConnect };
 });
 
-const { createSessionClient, SessionTimeoutError } = await import('../../src/session-client.js');
+import { createSessionClient, SessionTimeoutError } from '../../src/session-client.js';
 
 // ── Mock socket ───────────────────────────────────────────────────────────────
 
@@ -24,7 +24,7 @@ class MockSocket extends EventEmitter {
   write(data: string) { this.written.push(data); return true; }
   end(cb?: () => void) { this.destroyed = true; cb?.(); return this; }
   destroy() { this.destroyed = true; return this; }
-  removeListener(event: string, fn: (...args: unknown[]) => void) {
+  override removeListener(event: string, fn: (...args: unknown[]) => void) {
     super.removeListener(event, fn);
     return this;
   }
@@ -41,7 +41,6 @@ const logger = pino({ level: 'silent' });
 const fakeHost = {
   hostId: 'h1',
   modelName: 'gpt',
-  contextSize: 4096,
   endpoint: '10.0.0.1:9000',
   tlsFingerprint: 'sha256:' + 'a'.repeat(64),
   hostKeyToken: 'host-key-token',
@@ -110,7 +109,8 @@ describe('SessionClient', () => {
       const openPromise = client.openSession(fakeHost);
 
       await new Promise((r) => setTimeout(r, 0));
-      sock.inject({ v: PROTOCOL_VERSION, type: 'response_chunk', content: 'oops' });
+      // Send a message type that is not session_ack or session_reject
+      sock.inject({ v: PROTOCOL_VERSION, type: 'session_timeout' });
 
       await expect(openPromise).rejects.toThrow(ProtocolVersionError);
     });
@@ -123,10 +123,16 @@ describe('SessionClient', () => {
     });
   });
 
-  // ─── 5-3: Prompt / response ──────────────────────────────────────────────
+  // ─── Phase 2: sendInferenceRequest / abort / isAlive ────────────────────
+  // Full tests written in user Phase 9 of the implementation plan.
 
-  describe('sendPrompt — prompt/response cycle', () => {
-    async function openedClient() {
+  describe('isAlive', () => {
+    it('returns false before openSession', () => {
+      const client = createSessionClient({ logger });
+      expect(client.isAlive()).toBe(false);
+    });
+
+    it('returns true after successful openSession', async () => {
       const sock = new MockSocket();
       mockConnect.mockResolvedValueOnce(sock);
       const client = createSessionClient({ logger });
@@ -134,73 +140,35 @@ describe('SessionClient', () => {
       await new Promise((r) => setTimeout(r, 0));
       sock.inject({ v: PROTOCOL_VERSION, type: 'session_ack' });
       await openPromise;
-      return { client, sock };
-    }
-
-    it('sends PromptPayload with the full messages array passed by the caller', async () => {
-      const { client, sock } = await openedClient();
-
-      const messages = [
-        { role: 'user', content: 'hello' },
-        { role: 'assistant', content: 'hi' },
-        { role: 'user', content: 'how are you?' },
-      ];
-
-      const sendPromise = client.sendPrompt(messages, vi.fn(), vi.fn());
-      await new Promise((r) => setTimeout(r, 0));
-      sock.inject({ v: PROTOCOL_VERSION, type: 'response_end' });
-      await sendPromise;
-
-      const promptMsg = sock.messages().find((m) => m['type'] === 'prompt')!;
-      expect(promptMsg['messages']).toEqual(messages);
+      expect(client.isAlive()).toBe(true);
     });
 
-    it('calls onChunk for each response_chunk', async () => {
-      const { client, sock } = await openedClient();
-      const chunks: string[] = [];
-
-      const sendPromise = client.sendPrompt([], (c) => chunks.push(c), vi.fn());
+    it('returns false after abort()', async () => {
+      const sock = new MockSocket();
+      mockConnect.mockResolvedValueOnce(sock);
+      const client = createSessionClient({ logger });
+      const openPromise = client.openSession(fakeHost);
       await new Promise((r) => setTimeout(r, 0));
-
-      sock.inject({ v: PROTOCOL_VERSION, type: 'response_chunk', content: 'Hello' });
-      sock.inject({ v: PROTOCOL_VERSION, type: 'response_chunk', content: ' world' });
-      sock.inject({ v: PROTOCOL_VERSION, type: 'response_end' });
-
-      await sendPromise;
-      expect(chunks).toEqual(['Hello', ' world']);
+      sock.inject({ v: PROTOCOL_VERSION, type: 'session_ack' });
+      await openPromise;
+      client.abort();
+      expect(client.isAlive()).toBe(false);
     });
+  });
 
-    it('calls onEnd and resolves sendPrompt on response_end', async () => {
-      const { client, sock } = await openedClient();
-      const onEnd = vi.fn();
-
-      const sendPromise = client.sendPrompt([], vi.fn(), onEnd);
+  describe('sendInferenceRequest (stub)', () => {
+    it('throws "not implemented" — Phase 2 implementation pending', async () => {
+      const sock = new MockSocket();
+      mockConnect.mockResolvedValueOnce(sock);
+      const client = createSessionClient({ logger });
+      const openPromise = client.openSession(fakeHost);
       await new Promise((r) => setTimeout(r, 0));
-      sock.inject({ v: PROTOCOL_VERSION, type: 'response_end' });
+      sock.inject({ v: PROTOCOL_VERSION, type: 'session_ack' });
+      await openPromise;
 
-      await expect(sendPromise).resolves.toBeUndefined();
-      expect(onEnd).toHaveBeenCalledOnce();
-    });
-
-    it('session_timeout rejects in-flight sendPrompt with SessionTimeoutError', async () => {
-      const { client, sock } = await openedClient();
-
-      const sendPromise = client.sendPrompt([], vi.fn(), vi.fn());
-      await new Promise((r) => setTimeout(r, 0));
-      sock.inject({ v: PROTOCOL_VERSION, type: 'session_timeout' });
-
-      await expect(sendPromise).rejects.toThrow(SessionTimeoutError);
-    });
-
-    it('unexpected socket close rejects in-flight sendPrompt', async () => {
-      const { client, sock } = await openedClient();
-
-      const sendPromise = client.sendPrompt([], vi.fn(), vi.fn());
-      await new Promise((r) => setTimeout(r, 0));
-
-      sock.emit('close');
-
-      await expect(sendPromise).rejects.toThrow(/closed/i);
+      await expect(
+        client.sendInferenceRequest('{}', vi.fn(), new AbortController().signal),
+      ).rejects.toThrow('not implemented');
     });
   });
 });

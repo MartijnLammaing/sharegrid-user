@@ -28,7 +28,6 @@ describe('User integration — rejections', () => {
       {
         hostId: 'host-1',
         modelName: 'test-model',
-        contextSize: 4096,
         endpoint: `127.0.0.1:${mockHost.port}`,
         tlsFingerprint: mockHost.fingerprint,
         hostKeyToken: mockHost.hostKeyToken,

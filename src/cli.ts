@@ -4,14 +4,13 @@
  * Uses Node.js built-in `readline` for input. All user-visible output goes to
  * `process.stdout` via `process.stdout.write`. No external CLI framework.
  *
- * Responsibilities (Phase 1):
- *  - Render the host list and prompt for a selection.
- *  - Run the conversation loop, streaming responses chunk by chunk.
- *  - Handle errors per the plan spec (re-select, re-fetch, or exit).
- *  - Handle Ctrl+C (SIGINT) cleanly.
+ * Phase 2 note: the conversation loop is being updated in user Phase 6 of the
+ * implementation plan to use sendInferenceRequest + SSE parsing. This file
+ * currently contains the Phase 0 stub — session open/close/SIGINT are intact;
+ * the inference path throws 'not implemented' from sendInferenceRequest.
  *
- * See: docs/architecture_llmuser.md §2.3
- *      docs/implementation_plan_llmuser.md Phase 3C
+ * See: docs/architecture_llmuser.md §2.6
+ *      docs/implementation_plan_llmuser.md Phase 6
  */
 
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
@@ -21,7 +20,6 @@ import type { RouterClient } from './router-client.js';
 import type { SessionClient } from './session-client.js';
 import {
   SessionTimeoutError,
-  PromptCancelledError,
   TlsFingerprintError,
   HostBusyError,
   InvalidTokenError,
@@ -151,23 +149,29 @@ export function createCli(deps: CliDeps): Cli {
       let accumulated = '';
       try {
         generationInFlight = true;
-        await sessionClient.sendPrompt(
-          [{ role: 'system', content: SYSTEM_PROMPT }, ...messages],
-          (chunk) => {
-            accumulated += chunk;
-            process.stdout.write(chunk);
+        const controller = new AbortController();
+        // Phase 2 full implementation in user Phase 6 — see implementation plan.
+        // sendInferenceRequest builds the OpenAI body, streams SSE lines, and
+        // parses delta.content for display. Currently throws 'not implemented'.
+        await sessionClient.sendInferenceRequest(
+          JSON.stringify({
+            model: host.modelName,
+            messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...messages],
+            stream: true,
+          }),
+          (sseLine) => {
+            // Parse delta.content from raw SSE line — Phase 6 implementation.
+            void sseLine;
+            void accumulated;
           },
-          () => {
-            // onEnd — trailing newline written below after await resolves.
-          },
+          controller.signal,
         );
         process.stdout.write('\n\n');
         messages.push({ role: 'assistant', content: accumulated });
       } catch (err) {
         process.stdout.write('\n');
-        if (err instanceof PromptCancelledError) {
-          process.stdout.write('[stopped]\n\n');
-          // Discard partial response; do not add to history. Continue the loop.
+        if (err instanceof Error && err.message === 'not implemented') {
+          process.stdout.write('[inference not yet implemented — Phase 6]\n\n');
         } else {
           return handlePromptError(err);
         }
@@ -269,12 +273,10 @@ export function createCli(deps: CliDeps): Cli {
     process.on('SIGINT', () => {
       void (async () => {
         if (generationInFlight) {
-          // Cancel the in-flight response without exiting.
-          try {
-            await sessionClient.cancelPrompt();
-          } catch {
-            // ignore — PromptCancelledError will surface through sendPrompt
-          }
+          // Abort the in-flight request — host detects socket close and cancels.
+          sessionClient.abort();
+          generationInFlight = false;
+          process.stdout.write('\n[stopped]\n\n');
           return;
         }
         // Not generating — exit cleanly.

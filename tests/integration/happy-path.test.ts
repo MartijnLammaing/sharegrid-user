@@ -28,7 +28,6 @@ describe('User integration — happy path', () => {
       {
         hostId: 'host-1',
         modelName: 'test-model',
-        contextSize: 4096,
         endpoint: `127.0.0.1:${mockHost.port}`,
         tlsFingerprint: mockHost.fingerprint,
         hostKeyToken: mockHost.hostKeyToken,
@@ -41,9 +40,8 @@ describe('User integration — happy path', () => {
     mockHost.stop();
   });
 
-  it('fetches host list, opens session, receives response chunks, and sends session_close', async () => {
+  it('fetches host list and opens/closes session cleanly', async () => {
     const config = makeConfig(mockRouter);
-    mockHost.promptChunks = ['Hello', ' world'];
 
     // 1. Fetch host list via Router Client
     const routerClient = createRouterClient({ config, logger });
@@ -55,15 +53,7 @@ describe('User integration — happy path', () => {
     // 2. Open session via Session Client
     const sessionClient = createSessionClient({ logger });
     await sessionClient.openSession(hosts[0]!);
-
-    const chunks: string[] = [];
-    await sessionClient.sendPrompt(
-      [{ role: 'user', content: 'hi' }],
-      (c) => chunks.push(c),
-      () => { /* onEnd */ },
-    );
-
-    expect(chunks).toEqual(['Hello', ' world']);
+    expect(sessionClient.isAlive()).toBe(true);
 
     // 3. Close session — mock host must receive session_close
     await sessionClient.closeSession();
@@ -72,6 +62,8 @@ describe('User integration — happy path', () => {
     const closeMsg = mockHost.received.find((m) => m['type'] === 'session_close');
     expect(closeMsg).toBeDefined();
   }, 10_000);
+
+  // sendInferenceRequest (Phase 2) integration test is in user Phase 10.
 
   it('router client closes the TLS connection after receiving the host list', async () => {
     const config = makeConfig(mockRouter);

@@ -5,7 +5,7 @@ import { PROTOCOL_VERSION } from '@sharegrid/shared/protocol';
 import pino from 'pino';
 
 // ── Mock @sharegrid/shared/tls ────────────────────────────────────────────────
-const mockConnect = vi.fn();
+const { mockConnect } = vi.hoisted(() => ({ mockConnect: vi.fn() }));
 vi.mock('@sharegrid/shared/tls', async (importOriginal) => {
   const real = await importOriginal<typeof import('@sharegrid/shared/tls')>();
   return {
@@ -14,8 +14,7 @@ vi.mock('@sharegrid/shared/tls', async (importOriginal) => {
   };
 });
 
-// ── Import SUT after mocks are set up ─────────────────────────────────────────
-const { createRouterClient } = await import('../../src/router-client.js');
+import { createRouterClient } from '../../src/router-client.js';
 
 // ── Mock socket factory ───────────────────────────────────────────────────────
 class MockSocket extends EventEmitter {
@@ -27,7 +26,7 @@ class MockSocket extends EventEmitter {
   write(data: string) { this.written.push(data); return true; }
   end() { this.destroyed = true; return this; }
   destroy() { this.destroyed = true; return this; }
-  removeListener(event: string, fn: (...args: unknown[]) => void) {
+  override removeListener(event: string, fn: (...args: unknown[]) => void) {
     super.removeListener(event, fn);
     return this;
   }

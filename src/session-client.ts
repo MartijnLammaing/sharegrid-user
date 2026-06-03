@@ -1,15 +1,21 @@
 /**
  * Session Client — owns the direct TLS connection to a chosen LLMHost.
  *
- * Responsibilities (Phase 1):
+ * Phase 2 responsibilities:
  *  - Open a TLS connection pinned to the host's cert fingerprint.
- *  - Present the host key token to open a session.
- *  - Send prompts and stream responses back to the caller via callbacks.
+ *  - Present the host key token to open a session (session_open → session_ack).
+ *  - Send InferenceRequestPayload messages and stream InferenceResponseChunk
+ *    messages back to the caller.
+ *  - Keep the session open between inference turns (persistent session model).
  *  - Handle host-initiated termination (SessionTimeout, SessionClose).
+ *  - Expose abort() to destroy the socket (signals the host to cancel).
  *  - Close the connection cleanly on user exit.
  *
- * See: docs/architecture_llmuser.md §2.2, §4
- *      docs/implementation_plan_llmuser.md Phase 3B
+ * The full Phase 2 sendInferenceRequest implementation is in user Phase 2 of
+ * the implementation plan. This file contains the Phase 0 stub.
+ *
+ * See: docs/architecture_llmuser.md §2.4
+ *      docs/implementation_plan_llmuser.md Phase 2
  */
 
 import { type TLSSocket } from 'node:tls';
@@ -25,15 +31,9 @@ import {
 import {
   PROTOCOL_VERSION,
   type HostListEntry,
-  type ChatMessage,
   type SessionOpenPayload,
   type SessionAck,
   type SessionReject,
-  type PromptPayload,
-  type PromptCancel,
-  type PromptCancelled,
-  type ResponseChunk,
-  type ResponseEnd,
   type SessionClose,
   type SessionTimeout,
   type UserFromHostMessage,
@@ -49,15 +49,6 @@ export class SessionTimeoutError extends Error {
   constructor(message = 'session timed out') {
     super(message);
     this.name = 'SessionTimeoutError';
-  }
-}
-
-/** The in-flight prompt was cancelled by the user via cancelPrompt(). */
-export class PromptCancelledError extends Error {
-  readonly code = 'PROMPT_CANCELLED' as const;
-  constructor(message = 'prompt cancelled') {
-    super(message);
-    this.name = 'PromptCancelledError';
   }
 }
 
@@ -82,29 +73,32 @@ export interface SessionClient {
   openSession(host: HostListEntry): Promise<void>;
 
   /**
-   * Send a prompt and stream the response.
-   * The caller owns the full conversation history and passes it on every call.
+   * Send the full OpenAI request body and stream raw SSE lines back.
    *
-   * @param messages  Full message history including the new user turn.
-   * @param onChunk   Called for each streamed response token.
-   * @param onEnd     Called once when the response is complete.
-   * @throws {SessionTimeoutError}   if the host times out the session mid-prompt.
-   * @throws {PromptCancelledError}  if cancelPrompt() was called while in flight.
+   * Sends an `inference_request` message carrying the JSON-serialised OpenAI
+   * request body. Calls `onChunk` for each received `inference_response_chunk`
+   * data field. Resolves when `data: [DONE]` is received or the request is
+   * aborted via the provided `signal`.
+   *
+   * Implemented in Phase 2 user task 2-1.
    */
-  sendPrompt(
-    messages: ChatMessage[],
-    onChunk: (content: string) => void,
-    onEnd: () => void,
+  sendInferenceRequest(
+    body: string,
+    onChunk: (sseLine: string) => void,
+    signal: AbortSignal,
   ): Promise<void>;
 
   /**
-   * Cancel the in-flight prompt. Sends prompt_cancel to the host and waits for
-   * prompt_cancelled. The in-flight sendPrompt promise rejects with
-   * PromptCancelledError. No-op if no prompt is in flight.
+   * Destroy the TLS socket immediately, cancelling any in-flight inference.
+   * The host detects the close, aborts the llama.cpp request, and flushes the
+   * KV cache. The session is marked dead; the next acquire() will re-open it.
    */
-  cancelPrompt(): Promise<void>;
+  abort(): void;
 
-  /** Send SessionClose and close the socket. */
+  /** Returns true if the session socket is alive and the session is open. */
+  isAlive(): boolean;
+
+  /** Send SessionClose and close the socket gracefully. */
   closeSession(): Promise<void>;
 }
 
@@ -126,14 +120,6 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
   let sock: TLSSocket | null = null;
   let sessionActive = false;
 
-  // In-flight prompt bookkeeping: resolve/reject are set when sendPrompt is
-  // waiting for a response, cleared when the response completes.
-  let promptResolve: (() => void) | null = null;
-  let promptReject: ((err: Error) => void) | null = null;
-
-  // cancelPrompt bookkeeping: set while waiting for prompt_cancelled from host.
-  let cancelResolve: (() => void) | null = null;
-
   // ── NDJSON framing ────────────────────────────────────────────────────────
 
   function writeMessage(msg: object): void {
@@ -145,12 +131,10 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
   // ── openSession ───────────────────────────────────────────────────────────
 
   async function openSession(host: HostListEntry): Promise<void> {
-    // Parse the endpoint into host + port. The endpoint is `host:port`.
     const lastColon = host.endpoint.lastIndexOf(':');
     const endpointHost = host.endpoint.slice(0, lastColon);
     const endpointPort = parseInt(host.endpoint.slice(lastColon + 1), 10);
 
-    // Connect with TLS cert pinning BEFORE presenting the token.
     sock = await connectWithPinnedFingerprint({
       host: endpointHost,
       port: endpointPort,
@@ -176,7 +160,7 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
           reject(wrapped);
         } else {
           log.warn({ err }, 'session socket error');
-          rejectInFlight(wrapped);
+          sessionActive = false;
         }
       });
 
@@ -184,8 +168,6 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
         sessionActive = false;
         if (!handshakeDone) {
           reject(new Error('host closed connection before session ack'));
-        } else {
-          rejectInFlight(new Error('host closed connection unexpectedly'));
         }
       });
 
@@ -195,7 +177,6 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
           sock?.destroy();
           const err = new Error('host message exceeded 1 MiB');
           if (!handshakeDone) reject(err);
-          else rejectInFlight(err);
           return;
         }
 
@@ -211,7 +192,6 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
           } catch {
             const err = new Error('host sent non-JSON message');
             if (!handshakeDone) reject(err);
-            else rejectInFlight(err);
             return;
           }
 
@@ -222,14 +202,12 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
           ) {
             const err = new ProtocolVersionError();
             if (!handshakeDone) reject(err);
-            else rejectInFlight(err);
             return;
           }
 
           const msg = raw as unknown as UserFromHostMessage;
 
           if (!handshakeDone) {
-            // First message must be session_ack or session_reject.
             handleHandshakeMessage(msg, resolve, reject);
             if (msg.type === 'session_ack') {
               handshakeDone = true;
@@ -240,7 +218,6 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
         }
       });
 
-      // Send session_open.
       const open: SessionOpenPayload = {
         v: PROTOCOL_VERSION,
         type: 'session_open',
@@ -294,44 +271,15 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
 
   function handleSessionMessage(msg: UserFromHostMessage): void {
     switch (msg.type) {
-      case 'response_chunk': {
-        const chunk: ResponseChunk = msg;
-        // Route chunk to the in-flight sendPrompt call.
-        if (promptResolve !== null) {
-          // The CLI's onChunk callback is stored elsewhere; we need to call it.
-          // We communicate via the registered chunk callback.
-          activeOnChunk?.(chunk.content);
-        }
+      case 'inference_response_chunk':
+        // Phase 2 implementation: route to active sendInferenceRequest call.
+        log.debug({ data: msg.data }, 'inference_response_chunk (stub — not yet routed)');
         break;
-      }
-      case 'response_end': {
-        const _end: ResponseEnd = msg;
-        void _end;
-        activeOnEnd?.();
-        const res = promptResolve;
-        promptResolve = null;
-        promptReject = null;
-        activeOnChunk = null;
-        activeOnEnd = null;
-        res?.();
-        break;
-      }
-      case 'prompt_cancelled': {
-        const _pc: PromptCancelled = msg;
-        void _pc;
-        // Resolve the cancelPrompt() promise first, then reject sendPrompt.
-        const res = cancelResolve;
-        cancelResolve = null;
-        res?.();
-        rejectInFlight(new PromptCancelledError());
-        break;
-      }
       case 'session_timeout': {
         const _t: SessionTimeout = msg;
         void _t;
         log.info('session timed out by host');
         sessionActive = false;
-        rejectInFlight(new SessionTimeoutError());
         sock?.destroy();
         break;
       }
@@ -340,14 +288,6 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
         void _c;
         log.info('host initiated session close');
         sessionActive = false;
-        // Resolve any in-flight prompt as end-of-stream.
-        activeOnEnd?.();
-        const res = promptResolve;
-        promptResolve = null;
-        promptReject = null;
-        activeOnChunk = null;
-        activeOnEnd = null;
-        res?.();
         sock?.destroy();
         break;
       }
@@ -360,59 +300,28 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
     }
   }
 
-  // ── Callbacks for the active sendPrompt call ──────────────────────────────
+  // ── sendInferenceRequest (Phase 2 stub) ───────────────────────────────────
 
-  let activeOnChunk: ((content: string) => void) | null = null;
-  let activeOnEnd: (() => void) | null = null;
-
-  function rejectInFlight(err: Error): void {
-    const rej = promptReject;
-    promptResolve = null;
-    promptReject = null;
-    activeOnChunk = null;
-    activeOnEnd = null;
-    rej?.(err);
-  }
-
-  // ── sendPrompt ─────────────────────────────────────────────────────────────
-
-  async function sendPrompt(
-    messages: ChatMessage[],
-    onChunk: (content: string) => void,
-    onEnd: () => void,
+  async function sendInferenceRequest(
+    _body: string,
+    _onChunk: (sseLine: string) => void,
+    _signal: AbortSignal,
   ): Promise<void> {
-    if (!sessionActive || sock === null) {
-      throw new Error('sendPrompt called before openSession succeeded');
-    }
-
-    return new Promise<void>((resolve, reject) => {
-      promptResolve = resolve;
-      promptReject = reject;
-      activeOnChunk = onChunk;
-      activeOnEnd = onEnd;
-
-      const payload: PromptPayload = {
-        v: PROTOCOL_VERSION,
-        type: 'prompt',
-        messages,
-      };
-      writeMessage(payload);
-    });
+    throw new Error('not implemented');
   }
 
-  // ── cancelPrompt ──────────────────────────────────────────────────────────
+  // ── abort ─────────────────────────────────────────────────────────────────
 
-  async function cancelPrompt(): Promise<void> {
-    if (!sessionActive || sock === null || promptResolve === null) {
-      // No prompt in flight — nothing to cancel.
-      return;
-    }
+  function abort(): void {
+    sessionActive = false;
+    sock?.destroy();
+    sock = null;
+  }
 
-    return new Promise<void>((resolve) => {
-      cancelResolve = resolve;
-      const payload: PromptCancel = { v: PROTOCOL_VERSION, type: 'prompt_cancel' };
-      writeMessage(payload);
-    });
+  // ── isAlive ───────────────────────────────────────────────────────────────
+
+  function isAlive(): boolean {
+    return sessionActive && sock !== null && !sock.destroyed;
   }
 
   // ── closeSession ──────────────────────────────────────────────────────────
@@ -439,7 +348,7 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
     sock = null;
   }
 
-  return { openSession, sendPrompt, cancelPrompt, closeSession };
+  return { openSession, sendInferenceRequest, abort, isAlive, closeSession };
 }
 
 export {
