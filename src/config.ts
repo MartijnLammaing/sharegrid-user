@@ -13,6 +13,13 @@ const ConfigSchema = z.object({
     .refine((val) => keyPattern.test(val), {
       message: 'must contain key=<base64url> query param (user access secret from router)',
     }),
+  SHAREGRID_LISTEN_PORT: z.coerce
+    .number()
+    .int()
+    .min(1, 'must be >= 1')
+    .max(65535, 'must be <= 65535')
+    .default(3000),
+  SHAREGRID_MODE: z.enum(['server', 'cli']).default('server'),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;

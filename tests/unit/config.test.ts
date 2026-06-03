@@ -18,6 +18,8 @@ describe('loadConfig', () => {
   afterEach(() => {
     vi.restoreAllMocks();
     delete process.env['SHAREGRID_ROUTER_URL'];
+    delete process.env['SHAREGRID_LISTEN_PORT'];
+    delete process.env['SHAREGRID_MODE'];
   });
 
   async function load() {
@@ -66,5 +68,74 @@ describe('loadConfig', () => {
     process.env['SHAREGRID_ROUTER_URL'] = validUrl;
     const config = await load();
     expect(config.SHAREGRID_ROUTER_URL).toContain('key=testUserKey123');
+  });
+
+  // ── SHAREGRID_LISTEN_PORT ─────────────────────────────────────────────────
+
+  describe('SHAREGRID_LISTEN_PORT', () => {
+    it('defaults to 3000 when not set', async () => {
+      process.env['SHAREGRID_ROUTER_URL'] = validUrl;
+      const config = await load();
+      expect(config.SHAREGRID_LISTEN_PORT).toBe(3000);
+    });
+
+    it('parses a valid port string as a number', async () => {
+      process.env['SHAREGRID_ROUTER_URL'] = validUrl;
+      process.env['SHAREGRID_LISTEN_PORT'] = '9090';
+      const config = await load();
+      expect(config.SHAREGRID_LISTEN_PORT).toBe(9090);
+    });
+
+    it('exits with code 1 for port 0 (below minimum)', async () => {
+      process.env['SHAREGRID_ROUTER_URL'] = validUrl;
+      process.env['SHAREGRID_LISTEN_PORT'] = '0';
+      await expect(load()).rejects.toThrow('process.exit called');
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    });
+
+    it('exits with code 1 for port 65536 (above maximum)', async () => {
+      process.env['SHAREGRID_ROUTER_URL'] = validUrl;
+      process.env['SHAREGRID_LISTEN_PORT'] = '65536';
+      await expect(load()).rejects.toThrow('process.exit called');
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    });
+
+    it('exits with code 1 for a non-numeric value', async () => {
+      process.env['SHAREGRID_ROUTER_URL'] = validUrl;
+      process.env['SHAREGRID_LISTEN_PORT'] = 'abc';
+      await expect(load()).rejects.toThrow('process.exit called');
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    });
+  });
+
+  // ── SHAREGRID_MODE ────────────────────────────────────────────────────────
+
+  describe('SHAREGRID_MODE', () => {
+    it('defaults to "server" when not set', async () => {
+      process.env['SHAREGRID_ROUTER_URL'] = validUrl;
+      const config = await load();
+      expect(config.SHAREGRID_MODE).toBe('server');
+    });
+
+    it('parses "server" correctly', async () => {
+      process.env['SHAREGRID_ROUTER_URL'] = validUrl;
+      process.env['SHAREGRID_MODE'] = 'server';
+      const config = await load();
+      expect(config.SHAREGRID_MODE).toBe('server');
+    });
+
+    it('parses "cli" correctly', async () => {
+      process.env['SHAREGRID_ROUTER_URL'] = validUrl;
+      process.env['SHAREGRID_MODE'] = 'cli';
+      const config = await load();
+      expect(config.SHAREGRID_MODE).toBe('cli');
+    });
+
+    it('exits with code 1 for an invalid mode value', async () => {
+      process.env['SHAREGRID_ROUTER_URL'] = validUrl;
+      process.env['SHAREGRID_MODE'] = 'web';
+      await expect(load()).rejects.toThrow('process.exit called');
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    });
   });
 });
