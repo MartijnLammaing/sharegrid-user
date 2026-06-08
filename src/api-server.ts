@@ -214,7 +214,7 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
       return new Promise<void>((resolve, reject) => {
         server = createServer((req, res) => { void handleRequest(req, res); });
         server.on('error', reject);
-        server.listen(config.SHAREGRID_LISTEN_PORT, '127.0.0.1', () => {
+        server.listen(config.SHAREGRID_LISTEN_PORT, config.SHAREGRID_LISTEN_HOST, () => {
           log.info({ port: config.SHAREGRID_LISTEN_PORT }, 'API server listening');
           resolve();
         });

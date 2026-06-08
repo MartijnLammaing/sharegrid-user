@@ -19,6 +19,7 @@ const ConfigSchema = z.object({
     .min(1, 'must be >= 1')
     .max(65535, 'must be <= 65535')
     .default(3000),
+  SHAREGRID_LISTEN_HOST: z.string().default('127.0.0.1'),
   SHAREGRID_MODE: z.enum(['server', 'cli']).default('server'),
 });
 
