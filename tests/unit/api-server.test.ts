@@ -87,6 +87,7 @@ function makeConfig(port: number) {
   return {
     SHAREGRID_ROUTER_URL: 'https://x:1?fp=sha256:' + 'a'.repeat(64) + '&key=k',
     SHAREGRID_LISTEN_PORT: port,
+    SHAREGRID_LISTEN_HOST: '127.0.0.1',
     SHAREGRID_MODE: 'server' as const,
   };
 }

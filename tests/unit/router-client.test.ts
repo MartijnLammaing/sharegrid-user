@@ -38,7 +38,7 @@ class MockSocket extends EventEmitter {
 
 const logger = pino({ level: 'silent' });
 const validUrl = 'https://router.example.com:8443?fp=sha256:' + 'a'.repeat(64) + '&key=testUserSecret';
-const config = { SHAREGRID_ROUTER_URL: validUrl, SHAREGRID_LISTEN_PORT: 3000, SHAREGRID_MODE: 'server' as const };
+const config = { SHAREGRID_ROUTER_URL: validUrl, SHAREGRID_LISTEN_PORT: 3000, SHAREGRID_LISTEN_HOST: '127.0.0.1', SHAREGRID_MODE: 'server' as const };
 
 describe('RouterClient (user)', () => {
   beforeEach(() => {
@@ -68,7 +68,7 @@ describe('RouterClient (user)', () => {
   });
 
   it('propagates RoleKeyMissingError when URL lacks key param', async () => {
-    const noKeyConfig = { SHAREGRID_ROUTER_URL: 'https://router.example.com:8443?fp=sha256:' + 'a'.repeat(64), SHAREGRID_LISTEN_PORT: 3000, SHAREGRID_MODE: 'server' as const };
+    const noKeyConfig = { SHAREGRID_ROUTER_URL: 'https://router.example.com:8443?fp=sha256:' + 'a'.repeat(64), SHAREGRID_LISTEN_PORT: 3000, SHAREGRID_LISTEN_HOST: '127.0.0.1', SHAREGRID_MODE: 'server' as const };
     const client = createRouterClient({ config: noKeyConfig, logger });
     const err = await client.fetchHostList().catch((e: unknown) => e);
     expect(err).toMatchObject({ code: 'ROLE_KEY_MISSING' });

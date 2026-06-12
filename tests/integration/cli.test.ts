@@ -89,6 +89,7 @@ describe('User integration — CLI mode', () => {
     const config = {
       SHAREGRID_ROUTER_URL: routerUrl,
       SHAREGRID_LISTEN_PORT: 3000,
+      SHAREGRID_LISTEN_HOST: '127.0.0.1',
       SHAREGRID_MODE: 'cli' as const,
     };
     const routerClient = createRouterClient({ config, logger });
