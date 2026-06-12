@@ -43,7 +43,7 @@ describe('User integration — router unreachable', () => {
 
   it('Router Client fails with a connection error when no router is running', async () => {
     const config = {
-      SHAREGRID_ROUTER_URL: 'https://127.0.0.1:19999?fp=sha256:' + 'a'.repeat(64) + '&key=dummykey', SHAREGRID_LISTEN_PORT: 3000, SHAREGRID_MODE: 'server' as const,
+      SHAREGRID_ROUTER_URL: 'https://127.0.0.1:19999?fp=sha256:' + 'a'.repeat(64) + '&key=dummykey', SHAREGRID_LISTEN_PORT: 3000, SHAREGRID_LISTEN_HOST: '127.0.0.1', SHAREGRID_MODE: 'server' as const,
     };
 
     const routerClient = createRouterClient({ config, logger });
@@ -52,7 +52,7 @@ describe('User integration — router unreachable', () => {
 
   it('CLI exits with a non-zero code and prints an error when router is unreachable', async () => {
     const config = {
-      SHAREGRID_ROUTER_URL: 'https://127.0.0.1:19999?fp=sha256:' + 'a'.repeat(64) + '&key=dummykey', SHAREGRID_LISTEN_PORT: 3000, SHAREGRID_MODE: 'server' as const,
+      SHAREGRID_ROUTER_URL: 'https://127.0.0.1:19999?fp=sha256:' + 'a'.repeat(64) + '&key=dummykey', SHAREGRID_LISTEN_PORT: 3000, SHAREGRID_LISTEN_HOST: '127.0.0.1', SHAREGRID_MODE: 'server' as const,
     };
 
     const routerClient = createRouterClient({ config, logger });
@@ -86,6 +86,7 @@ describe('User integration — router unreachable', () => {
     const wrongKeyConfig = {
       SHAREGRID_ROUTER_URL: `https://127.0.0.1:${mockRouter.port}?fp=${mockRouter.fingerprint}&key=completely-wrong-key`,
       SHAREGRID_LISTEN_PORT: 3000,
+      SHAREGRID_LISTEN_HOST: '127.0.0.1',
       SHAREGRID_MODE: 'server' as const,
     };
 

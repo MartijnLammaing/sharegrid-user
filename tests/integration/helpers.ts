@@ -247,10 +247,11 @@ export async function startMockHost(): Promise<MockHost> {
 export function makeConfig(
   router: MockRouter,
   listenPort = 3000,
-): { SHAREGRID_ROUTER_URL: string; SHAREGRID_LISTEN_PORT: number; SHAREGRID_MODE: 'server' | 'cli' } {
+): { SHAREGRID_ROUTER_URL: string; SHAREGRID_LISTEN_PORT: number; SHAREGRID_LISTEN_HOST: string; SHAREGRID_MODE: 'server' | 'cli' } {
   return {
     SHAREGRID_ROUTER_URL: `https://127.0.0.1:${router.port}?fp=${router.fingerprint}&key=${router.userSecret}`,
     SHAREGRID_LISTEN_PORT: listenPort,
+    SHAREGRID_LISTEN_HOST: '127.0.0.1',
     SHAREGRID_MODE: 'server',
   };
 }
