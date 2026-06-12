@@ -23,7 +23,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 PORT="${SHAREGRID_USER_PORT:-3000}"
 IMAGE="${SHAREGRID_USER_IMAGE:-sharegrid-user}"
-NETWORK=sharegrid-net
 CONTAINER=sharegrid-user
 
 BUILD=1
@@ -63,7 +62,6 @@ if [[ "$SERVER_MODE" -eq 1 ]]; then
   log "Starting ${CONTAINER} in server mode on port ${PORT}..."
   docker run -d \
     --name "$CONTAINER" \
-    --network "$NETWORK" \
     -p "${PORT}:${PORT}" \
     -e SHAREGRID_ROUTER_URL="$SHAREGRID_ROUTER_URL" \
     -e SHAREGRID_MODE=server \
@@ -79,7 +77,6 @@ if [[ "$SERVER_MODE" -eq 1 ]]; then
 else
   log "Launching ${CONTAINER} (CLI mode)..."
   docker run -it --rm \
-    --network "$NETWORK" \
     -e SHAREGRID_ROUTER_URL="$SHAREGRID_ROUTER_URL" \
     -e SHAREGRID_MODE=cli \
     "$IMAGE"
