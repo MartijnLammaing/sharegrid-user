@@ -17,7 +17,7 @@
 
 import { type TLSSocket } from 'node:tls';
 import type { Logger } from 'pino';
-import { connectWithPinnedFingerprint } from '@sharegrid/shared/tls';
+import { connectWithPinnedFingerprint, parseEndpoint } from '@sharegrid/shared/tls';
 import {
   HostBusyError,
   InvalidTokenError,
@@ -153,9 +153,9 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
   // ── openSession ───────────────────────────────────────────────────────────
 
   async function openSession(host: HostListEntry): Promise<void> {
-    const lastColon = host.endpoint.lastIndexOf(':');
-    const endpointHost = host.endpoint.slice(0, lastColon);
-    const endpointPort = parseInt(host.endpoint.slice(lastColon + 1), 10);
+    // parseEndpoint is bracket-aware: an internet-mode endpoint such as
+    // `[2001:db8::1]:9000` yields the bare IPv6 host that tls.connect expects.
+    const { host: endpointHost, port: endpointPort } = parseEndpoint(host.endpoint);
 
     sock = await connectWithPinnedFingerprint({
       host: endpointHost,
