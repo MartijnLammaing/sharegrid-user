@@ -42,6 +42,14 @@ export interface ModelRegistry {
    * @throws {HostNotFoundError} if no host with that model name is registered.
    */
   resolveHost(modelId: string): Promise<HostListEntry>;
+  /**
+   * Drop the current cache immediately so the next call to `getModels()` or
+   * `resolveHost()` fetches a fresh host list from the router.
+   *
+   * Call this whenever a connection error indicates a host has changed (e.g.
+   * TlsFingerprintError after a host restart with a new ephemeral cert).
+   */
+  invalidate(): void;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -84,6 +92,10 @@ export function createModelRegistry(deps: ModelRegistryDeps): ModelRegistry {
         throw new HostNotFoundError(`no host with model '${modelId}' is registered`);
       }
       return entry;
+    },
+
+    invalidate(): void {
+      cache = null;
     },
   };
 }

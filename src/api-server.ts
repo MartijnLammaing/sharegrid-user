@@ -1,9 +1,11 @@
 /**
  * API Server — OpenAI-compatible HTTP server for the LLMUser adapter.
  *
- * Binds exclusively to 127.0.0.1 (localhost). OpenCode connects to it as a
- * custom provider using @ai-sdk/openai-compatible. No authentication is
- * required; the ShareGrid credentials live in the adapter's environment.
+ * Binds to 0.0.0.0 inside the Docker container. The Docker port mapping
+ * restricts host exposure to 127.0.0.1, so the server is not accessible from
+ * the network. OpenCode connects to it as a custom provider using
+ * @ai-sdk/openai-compatible. No authentication is required; the ShareGrid
+ * credentials live in the adapter's environment.
  *
  * Endpoints:
  *   GET  /v1/models               — returns the active host list as OpenAI models
@@ -15,8 +17,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import type { Logger } from 'pino';
-import { HostNotFoundError } from '@sharegrid/shared/errors';
-import { HostBusyError } from '@sharegrid/shared/errors';
+import { HostNotFoundError, HostBusyError, TlsFingerprintError } from '@sharegrid/shared/errors';
 import type { Config } from './config.js';
 import type { ModelRegistry } from './model-registry.js';
 import type { HostSessionPool } from './host-session-pool.js';
@@ -138,6 +139,12 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
     } catch (err) {
       if (err instanceof HostBusyError) {
         sendError(res, 503, 'host is busy — try again later', 'service_unavailable');
+      } else if (err instanceof TlsFingerprintError) {
+        // The host restarted and has a new ephemeral TLS cert. Invalidate the
+        // model registry cache so the next request fetches fresh host data.
+        modelRegistry.invalidate();
+        log.warn({ err }, 'host TLS fingerprint mismatch — cache invalidated, client should retry');
+        sendError(res, 503, 'host unavailable — TLS certificate changed, please retry', 'service_unavailable');
       } else {
         log.error({ err }, 'error acquiring session');
         sendError(res, 500, 'internal server error', 'internal_error');
