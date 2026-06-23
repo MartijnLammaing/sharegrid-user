@@ -62,7 +62,7 @@ if [[ "$SERVER_MODE" -eq 1 ]]; then
   log "Starting ${CONTAINER} in server mode on port ${PORT}..."
   docker run -d \
     --name "$CONTAINER" \
-    -p "${PORT}:${PORT}" \
+    -p "127.0.0.1:${PORT}:${PORT}" \
     -e SHAREGRID_ROUTER_URL="$SHAREGRID_ROUTER_URL" \
     -e SHAREGRID_MODE=server \
     "$IMAGE"

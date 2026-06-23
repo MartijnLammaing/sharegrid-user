@@ -1,9 +1,11 @@
 /**
  * API Server — OpenAI-compatible HTTP server for the LLMUser adapter.
  *
- * Binds exclusively to 127.0.0.1 (localhost). OpenCode connects to it as a
- * custom provider using @ai-sdk/openai-compatible. No authentication is
- * required; the ShareGrid credentials live in the adapter's environment.
+ * Binds to 0.0.0.0 inside the Docker container. The Docker port mapping
+ * restricts host exposure to 127.0.0.1, so the server is not accessible from
+ * the network. OpenCode connects to it as a custom provider using
+ * @ai-sdk/openai-compatible. No authentication is required; the ShareGrid
+ * credentials live in the adapter's environment.
  *
  * Endpoints:
  *   GET  /v1/models               — returns the active host list as OpenAI models
