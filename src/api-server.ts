@@ -17,8 +17,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import type { Logger } from 'pino';
-import { HostNotFoundError } from '@sharegrid/shared/errors';
-import { HostBusyError } from '@sharegrid/shared/errors';
+import { HostNotFoundError, HostBusyError, TlsFingerprintError } from '@sharegrid/shared/errors';
 import type { Config } from './config.js';
 import type { ModelRegistry } from './model-registry.js';
 import type { HostSessionPool } from './host-session-pool.js';
@@ -140,6 +139,12 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
     } catch (err) {
       if (err instanceof HostBusyError) {
         sendError(res, 503, 'host is busy — try again later', 'service_unavailable');
+      } else if (err instanceof TlsFingerprintError) {
+        // The host restarted and has a new ephemeral TLS cert. Invalidate the
+        // model registry cache so the next request fetches fresh host data.
+        modelRegistry.invalidate();
+        log.warn({ err }, 'host TLS fingerprint mismatch — cache invalidated, client should retry');
+        sendError(res, 503, 'host unavailable — TLS certificate changed, please retry', 'service_unavailable');
       } else {
         log.error({ err }, 'error acquiring session');
         sendError(res, 500, 'internal server error', 'internal_error');
