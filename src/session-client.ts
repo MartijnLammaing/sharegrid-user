@@ -100,6 +100,13 @@ export interface SessionClient {
 
   /** Send SessionClose and close the socket gracefully. */
   closeSession(): Promise<void>;
+
+  /**
+   * Returns true if an inference request is currently in flight (sent but not
+   * yet resolved or rejected). Used by the session pool to implement
+   * conversation affinity: an idle session is reused for sequential turns.
+   */
+  isInferenceActive(): boolean;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -125,8 +132,10 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
   let activeInferenceResolve: (() => void) | null = null;
   let activeInferenceReject: ((err: Error) => void) | null = null;
   let activeOnChunk: ((sseLine: string) => void) | null = null;
+  let inferenceActive = false;
 
   function resolveActiveInference(): void {
+    inferenceActive = false;
     const r = activeInferenceResolve;
     activeInferenceResolve = null;
     activeInferenceReject = null;
@@ -135,6 +144,7 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
   }
 
   function rejectActiveInference(err: Error): void {
+    inferenceActive = false;
     const r = activeInferenceReject;
     activeInferenceResolve = null;
     activeInferenceReject = null;
@@ -347,6 +357,7 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
     }
 
     return new Promise<void>((resolve, reject) => {
+      inferenceActive = true;
       activeInferenceResolve = resolve;
       activeInferenceReject = reject;
       activeOnChunk = onChunk;
@@ -379,6 +390,12 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
     return sessionActive && sock !== null && !sock.destroyed;
   }
 
+  // ── isInferenceActive ─────────────────────────────────────────────────────
+
+  function isInferenceActive(): boolean {
+    return inferenceActive;
+  }
+
   // ── closeSession ──────────────────────────────────────────────────────────
 
   async function closeSession(): Promise<void> {
@@ -403,7 +420,7 @@ export function createSessionClient(deps: SessionClientDeps): SessionClient {
     sock = null;
   }
 
-  return { openSession, sendInferenceRequest, abort, isAlive, closeSession };
+  return { openSession, sendInferenceRequest, abort, isAlive, closeSession, isInferenceActive };
 }
 
 export {

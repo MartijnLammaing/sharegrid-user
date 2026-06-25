@@ -16,6 +16,7 @@ import {
   collectInference,
   extractContent,
   logger,
+  makeHostListEntry,
   type MockRouter,
   type MockHost,
 } from './helpers.js';
@@ -27,13 +28,13 @@ describe('User integration — happy path', () => {
   beforeEach(async () => {
     mockHost   = await startMockHost();
     mockRouter = await startMockRouter([
-      {
+      makeHostListEntry({
         hostId: 'host-1',
         modelName: 'test-model',
         endpoint: `127.0.0.1:${mockHost.port}`,
         tlsFingerprint: mockHost.fingerprint,
         hostKeyToken: mockHost.hostKeyToken,
-      },
+      }),
     ]);
   });
 
@@ -79,6 +80,28 @@ describe('User integration — happy path', () => {
 
     expect(extractContent(sseLines)).toBe('Hello world');
     expect(sseLines[sseLines.length - 1]).toBe('data: [DONE]');
+
+    await sessionClient.closeSession();
+  }, 10_000);
+
+  it('two sequential requests reuse the same session (conversation affinity)', async () => {
+    mockHost.inferenceChunks = ['ok'];
+
+    const config = makeConfig(mockRouter);
+    const routerClient = createRouterClient({ config, logger });
+    const hosts = await routerClient.fetchHostList();
+
+    const sessionClient = createSessionClient({ logger });
+    await sessionClient.openSession(hosts[0]!);
+
+    await collectInference(sessionClient, JSON.stringify({ model: 'test-model', messages: [{ role: 'user', content: 'turn 1' }] }));
+    await collectInference(sessionClient, JSON.stringify({ model: 'test-model', messages: [{ role: 'user', content: 'turn 2' }] }));
+
+    const sessionOpens = mockHost.received.filter((m) => m['type'] === 'session_open');
+    expect(sessionOpens).toHaveLength(1);
+
+    const inferenceRequests = mockHost.received.filter((m) => m['type'] === 'inference_request');
+    expect(inferenceRequests).toHaveLength(2);
 
     await sessionClient.closeSession();
   }, 10_000);

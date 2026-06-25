@@ -11,7 +11,7 @@ import { createServer as createNetServer, type AddressInfo } from 'node:net';
 import { request as httpRequest } from 'node:http';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import pino from 'pino';
-import { HostNotFoundError, HostBusyError } from '@sharegrid/shared/errors';
+import { HostNotFoundError, HostBusyError, TlsFingerprintError } from '@sharegrid/shared/errors';
 import { createApiServer } from '../../src/api-server.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -79,6 +79,13 @@ function post(port: number, path: string, bodyObj: unknown): Promise<HttpResult>
 const fakeHost = {
   hostId: 'h1', modelName: 'phi', endpoint: '10.0.0.1:9000',
   tlsFingerprint: 'sha256:' + 'a'.repeat(64), hostKeyToken: 'tok',
+  contextSize: 4096, availableSlots: 1, totalSlots: 1,
+};
+
+const fakeHost2 = {
+  hostId: 'h2', modelName: 'phi', endpoint: '10.0.0.2:9000',
+  tlsFingerprint: 'sha256:' + 'b'.repeat(64), hostKeyToken: 'tok2',
+  contextSize: 4096, availableSlots: 1, totalSlots: 1,
 };
 
 const logger = pino({ level: 'silent' });
@@ -97,7 +104,7 @@ function makeConfig(port: number) {
 describe('ApiServer', () => {
   let port: number;
   let mockGetModels: ReturnType<typeof vi.fn>;
-  let mockResolveHost: ReturnType<typeof vi.fn>;
+  let mockResolveHosts: ReturnType<typeof vi.fn>;
   let mockAcquire: ReturnType<typeof vi.fn>;
   let mockSendInferenceRequest: ReturnType<typeof vi.fn>;
   let server: Awaited<ReturnType<typeof createApiServer>>;
@@ -105,17 +112,17 @@ describe('ApiServer', () => {
   beforeEach(async () => {
     port = await getFreePort();
     mockGetModels = vi.fn();
-    mockResolveHost = vi.fn();
+    mockResolveHosts = vi.fn();
     mockAcquire = vi.fn();
     mockSendInferenceRequest = vi.fn().mockResolvedValue(undefined);
 
     const mockSession = { sendInferenceRequest: mockSendInferenceRequest, abort: vi.fn(), isAlive: vi.fn(() => true), closeSession: vi.fn() };
     mockAcquire.mockResolvedValue(mockSession);
-    mockResolveHost.mockResolvedValue(fakeHost);
+    mockResolveHosts.mockResolvedValue([fakeHost]);
 
     server = createApiServer({
       config: makeConfig(port),
-      modelRegistry: { getModels: mockGetModels, resolveHost: mockResolveHost },
+      modelRegistry: { getModels: mockGetModels, resolveHost: vi.fn(), resolveHosts: mockResolveHosts, invalidate: vi.fn() },
       sessionPool: { acquire: mockAcquire, closeAll: vi.fn() },
       logger,
     });
@@ -130,7 +137,9 @@ describe('ApiServer', () => {
   // ── GET /v1/models ──────────────────────────────────────────────────────────
 
   it('GET /v1/models returns { object: "list", data: [...] } with status 200', async () => {
-    mockGetModels.mockResolvedValue([{ id: 'phi', object: 'model', owned_by: 'sharegrid' }]);
+    mockGetModels.mockResolvedValue([
+      { id: 'phi', object: 'model', owned_by: 'sharegrid', context_length: 4096, sharegrid_available_slots: 1, sharegrid_total_slots: 1 },
+    ]);
 
     const result = await get(port, '/v1/models');
 
@@ -139,7 +148,11 @@ describe('ApiServer', () => {
     const body = JSON.parse(result.body) as Record<string, unknown>;
     expect(body['object']).toBe('list');
     expect(Array.isArray(body['data'])).toBe(true);
-    expect((body['data'] as Array<Record<string, unknown>>)[0]?.['id']).toBe('phi');
+    const first = (body['data'] as Array<Record<string, unknown>>)[0];
+    expect(first?.['id']).toBe('phi');
+    expect(first?.['sharegrid_available_slots']).toBe(1);
+    expect(first?.['sharegrid_total_slots']).toBe(1);
+    expect(first?.['context_length']).toBe(4096);
   });
 
   it('GET /v1/models returns 503 when model registry throws', async () => {
@@ -241,19 +254,69 @@ describe('ApiServer', () => {
   // ── Error paths ─────────────────────────────────────────────────────────────
 
   it('unknown model returns 404', async () => {
-    mockResolveHost.mockRejectedValue(new HostNotFoundError());
+    mockResolveHosts.mockRejectedValue(new HostNotFoundError());
 
     const result = await post(port, '/v1/chat/completions', { model: 'unknown' });
 
     expect(result.status).toBe(404);
   });
 
-  it('host busy returns 503', async () => {
+  it('first host busy routes to the second host', async () => {
+    mockResolveHosts.mockResolvedValue([fakeHost, fakeHost2]);
+    mockAcquire
+      .mockRejectedValueOnce(new HostBusyError())
+      .mockResolvedValueOnce({
+        sendInferenceRequest: mockSendInferenceRequest,
+        abort: vi.fn(),
+        isAlive: vi.fn(() => true),
+        closeSession: vi.fn(),
+      });
+
+    const result = await post(port, '/v1/chat/completions', { model: 'phi' });
+
+    expect(mockAcquire).toHaveBeenCalledTimes(2);
+    expect(mockAcquire).toHaveBeenNthCalledWith(1, fakeHost);
+    expect(mockAcquire).toHaveBeenNthCalledWith(2, fakeHost2);
+    expect(result.status).toBe(200);
+  });
+
+  it('all hosts busy returns 503', async () => {
+    mockResolveHosts.mockResolvedValue([fakeHost, fakeHost2]);
     mockAcquire.mockRejectedValue(new HostBusyError());
 
     const result = await post(port, '/v1/chat/completions', { model: 'phi' });
 
+    expect(mockAcquire).toHaveBeenCalledTimes(2);
     expect(result.status).toBe(503);
+    expect(result.body).toContain('all hosts are busy');
+  });
+
+  it('non-HostBusyError on first host invalidates cache and tries next host', async () => {
+    const mockInvalidate = vi.fn();
+    mockResolveHosts.mockResolvedValue([fakeHost, fakeHost2]);
+    mockAcquire
+      .mockRejectedValueOnce(new TlsFingerprintError('mismatch'))
+      .mockResolvedValueOnce({
+        sendInferenceRequest: mockSendInferenceRequest,
+        abort: vi.fn(),
+        isAlive: vi.fn(() => true),
+        closeSession: vi.fn(),
+      });
+
+    await server.stop();
+    server = createApiServer({
+      config: makeConfig(port),
+      modelRegistry: { getModels: mockGetModels, resolveHost: vi.fn(), resolveHosts: mockResolveHosts, invalidate: mockInvalidate },
+      sessionPool: { acquire: mockAcquire, closeAll: vi.fn() },
+      logger,
+    });
+    await server.start();
+
+    const result = await post(port, '/v1/chat/completions', { model: 'phi' });
+
+    expect(mockAcquire).toHaveBeenCalledTimes(2);
+    expect(mockInvalidate).toHaveBeenCalledOnce();
+    expect(result.status).toBe(200);
   });
 
   it('unknown path returns 404', async () => {

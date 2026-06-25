@@ -44,6 +44,9 @@ const fakeHost = {
   endpoint: '10.0.0.1:9000',
   tlsFingerprint: 'sha256:' + 'a'.repeat(64),
   hostKeyToken: 'host-key-token',
+  contextSize: 4096,
+  availableSlots: 1,
+  totalSlots: 1,
 };
 
 describe('SessionClient', () => {
@@ -153,6 +156,72 @@ describe('SessionClient', () => {
       await openPromise;
       client.abort();
       expect(client.isAlive()).toBe(false);
+    });
+  });
+
+  describe('isInferenceActive', () => {
+    it('returns false before sendInferenceRequest', async () => {
+      const sock = new MockSocket();
+      mockConnect.mockResolvedValueOnce(sock);
+      const client = createSessionClient({ logger });
+      const openPromise = client.openSession(fakeHost);
+      await new Promise((r) => setTimeout(r, 0));
+      sock.inject({ v: PROTOCOL_VERSION, type: 'session_ack' });
+      await openPromise;
+
+      expect(client.isInferenceActive()).toBe(false);
+    });
+
+    it('returns true while a sendInferenceRequest promise is pending', async () => {
+      const sock = new MockSocket();
+      mockConnect.mockResolvedValueOnce(sock);
+      const client = createSessionClient({ logger });
+      const openPromise = client.openSession(fakeHost);
+      await new Promise((r) => setTimeout(r, 0));
+      sock.inject({ v: PROTOCOL_VERSION, type: 'session_ack' });
+      await openPromise;
+
+      const promise = client.sendInferenceRequest('{}', vi.fn(), new AbortController().signal);
+      await new Promise((r) => setTimeout(r, 0));
+
+      expect(client.isInferenceActive()).toBe(true);
+
+      sock.inject({ v: PROTOCOL_VERSION, type: 'inference_response_chunk', data: 'data: [DONE]' });
+      await promise;
+    });
+
+    it('returns false after the promise resolves', async () => {
+      const sock = new MockSocket();
+      mockConnect.mockResolvedValueOnce(sock);
+      const client = createSessionClient({ logger });
+      const openPromise = client.openSession(fakeHost);
+      await new Promise((r) => setTimeout(r, 0));
+      sock.inject({ v: PROTOCOL_VERSION, type: 'session_ack' });
+      await openPromise;
+
+      const promise = client.sendInferenceRequest('{}', vi.fn(), new AbortController().signal);
+      await new Promise((r) => setTimeout(r, 0));
+      sock.inject({ v: PROTOCOL_VERSION, type: 'inference_response_chunk', data: 'data: [DONE]' });
+      await promise;
+
+      expect(client.isInferenceActive()).toBe(false);
+    });
+
+    it('returns false after the promise rejects', async () => {
+      const sock = new MockSocket();
+      mockConnect.mockResolvedValueOnce(sock);
+      const client = createSessionClient({ logger });
+      const openPromise = client.openSession(fakeHost);
+      await new Promise((r) => setTimeout(r, 0));
+      sock.inject({ v: PROTOCOL_VERSION, type: 'session_ack' });
+      await openPromise;
+
+      const promise = client.sendInferenceRequest('{}', vi.fn(), new AbortController().signal);
+      await new Promise((r) => setTimeout(r, 0));
+      sock.inject({ v: PROTOCOL_VERSION, type: 'session_timeout' });
+
+      await expect(promise).rejects.toThrow(SessionTimeoutError);
+      expect(client.isInferenceActive()).toBe(false);
     });
   });
 

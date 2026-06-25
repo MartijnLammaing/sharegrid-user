@@ -118,37 +118,54 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
     requestObj['stream'] = true;
     const bodyString = JSON.stringify(requestObj);
 
-    // 3. Resolve host — errors returned before any streaming.
-    let host: Awaited<ReturnType<typeof modelRegistry.resolveHost>>;
+    // 3. Resolve ordered list of hosts for this model.
+    let hosts: Awaited<ReturnType<typeof modelRegistry.resolveHosts>>;
     try {
-      host = await modelRegistry.resolveHost(model);
+      hosts = await modelRegistry.resolveHosts(model);
     } catch (err) {
       if (err instanceof HostNotFoundError) {
         sendError(res, 404, `model '${model}' not found`, 'not_found');
       } else {
-        log.error({ err }, 'error resolving host');
+        log.error({ err }, 'error resolving hosts');
         sendError(res, 500, 'internal server error', 'internal_error');
       }
       return;
     }
 
-    // 4. Acquire session — errors returned before any streaming.
-    let session: Awaited<ReturnType<typeof sessionPool.acquire>>;
-    try {
-      session = await sessionPool.acquire(host);
-    } catch (err) {
-      if (err instanceof HostBusyError) {
-        sendError(res, 503, 'host is busy — try again later', 'service_unavailable');
-      } else if (err instanceof TlsFingerprintError) {
-        // The host restarted and has a new ephemeral TLS cert. Invalidate the
-        // model registry cache so the next request fetches fresh host data.
-        modelRegistry.invalidate();
-        log.warn({ err }, 'host TLS fingerprint mismatch — cache invalidated, client should retry');
-        sendError(res, 503, 'host unavailable — TLS certificate changed, please retry', 'service_unavailable');
-      } else {
-        log.error({ err }, 'error acquiring session');
+    // 4. Acquire a session, trying hosts in order. HostBusyError means that
+    //    host is full — try the next. Other errors (e.g. TlsFingerprintError)
+    //    suggest stale registry data; invalidate the cache and continue.
+    let session: Awaited<ReturnType<typeof sessionPool.acquire>> | null = null;
+    let lastError: Error | null = null;
+    for (const host of hosts) {
+      try {
+        session = await sessionPool.acquire(host);
+        break;
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        if (err instanceof HostBusyError) {
+          log.debug({ hostId: host.hostId }, 'host busy, trying next host');
+          continue;
+        }
+        if (err instanceof TlsFingerprintError) {
+          log.warn(
+            { err, hostId: host.hostId },
+            'host TLS fingerprint mismatch — invalidating cache and trying next host',
+          );
+          modelRegistry.invalidate();
+          continue;
+        }
+        log.error({ err, hostId: host.hostId }, 'error acquiring session');
         sendError(res, 500, 'internal server error', 'internal_error');
+        return;
       }
+    }
+
+    if (session === null) {
+      const message = lastError instanceof HostBusyError
+        ? 'all hosts are busy — try again later'
+        : 'no host available for the requested model';
+      sendError(res, 503, message, 'service_unavailable');
       return;
     }
 

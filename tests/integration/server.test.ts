@@ -13,6 +13,7 @@ import {
   startMockHost,
   startUserServer,
   extractContent,
+  makeHostListEntry,
   type MockRouter,
   type MockHost,
 } from './helpers.js';
@@ -66,13 +67,13 @@ describe('User integration — server mode', () => {
 
   beforeEach(async () => {
     mockHost = await startMockHost();
-    mockRouter = await startMockRouter([{
+    mockRouter = await startMockRouter([makeHostListEntry({
       hostId: 'host-1',
       modelName: 'test-model',
       endpoint: `127.0.0.1:${mockHost.port}`,
       tlsFingerprint: mockHost.fingerprint,
       hostKeyToken: mockHost.hostKeyToken,
-    }]);
+    })]);
     userServer = await startUserServer(mockRouter);
   }, 15_000);
 
@@ -93,6 +94,9 @@ describe('User integration — server mode', () => {
     const data = body['data'] as Array<Record<string, unknown>>;
     expect(data).toHaveLength(1);
     expect(data[0]!['id']).toBe('test-model');
+    expect(data[0]!['context_length']).toBe(4096);
+    expect(data[0]!['sharegrid_available_slots']).toBe(1);
+    expect(data[0]!['sharegrid_total_slots']).toBe(1);
   }, 10_000);
 
   // ── POST /v1/chat/completions ─────────────────────────────────────────────
@@ -112,6 +116,49 @@ describe('User integration — server mode', () => {
     expect(result.body).toContain('data: [DONE]');
   }, 10_000);
 
+  // ── Multi-host model routing ───────────────────────────────────────────────
+
+  it('routes to the second host when the first host is full', async () => {
+    // Start a second mock host for the same model
+    const mockHost2 = await startMockHost();
+    mockRouter.hosts = [
+      makeHostListEntry({
+        hostId: 'host-1',
+        modelName: 'test-model',
+        endpoint: `127.0.0.1:${mockHost.port}`,
+        tlsFingerprint: mockHost.fingerprint,
+        hostKeyToken: mockHost.hostKeyToken,
+        availableSlots: 0,
+        totalSlots: 1,
+      }),
+      makeHostListEntry({
+        hostId: 'host-2',
+        modelName: 'test-model',
+        endpoint: `127.0.0.1:${mockHost2.port}`,
+        tlsFingerprint: mockHost2.fingerprint,
+        hostKeyToken: mockHost2.hostKeyToken,
+        availableSlots: 1,
+        totalSlots: 1,
+      }),
+    ];
+
+    mockHost.sessionRejectReason = 'busy';
+    mockHost2.inferenceChunks = ['routed'];
+
+    const result = await postStream(userServer.port, {
+      model: 'test-model',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+
+    expect(result.status).toBe(200);
+    expect(result.body).toContain('routed');
+    // Availability-aware sorting means the non-full host is tried first.
+    expect(mockHost2.received.some((m) => m['type'] === 'session_open')).toBe(true);
+    expect(mockHost.received.some((m) => m['type'] === 'session_open')).toBe(false);
+
+    mockHost2.stop();
+  }, 15_000);
+
   // ── Multi-turn: session pool reuse ────────────────────────────────────────
 
   it('multi-turn: second POST reuses the existing host session', async () => {
@@ -126,6 +173,45 @@ describe('User integration — server mode', () => {
     // Both inference_requests must have arrived
     const requests = mockHost.received.filter((m) => m['type'] === 'inference_request');
     expect(requests).toHaveLength(2);
+  }, 15_000);
+
+  // ── All-hosts-busy → 503 ─────────────────────────────────────────────────
+
+  it('returns 503 when all hosts for a model are busy', async () => {
+    const mockHost2 = await startMockHost();
+    mockRouter.hosts = [
+      makeHostListEntry({
+        hostId: 'host-1',
+        modelName: 'test-model',
+        endpoint: `127.0.0.1:${mockHost.port}`,
+        tlsFingerprint: mockHost.fingerprint,
+        hostKeyToken: mockHost.hostKeyToken,
+        availableSlots: 0,
+        totalSlots: 1,
+      }),
+      makeHostListEntry({
+        hostId: 'host-2',
+        modelName: 'test-model',
+        endpoint: `127.0.0.1:${mockHost2.port}`,
+        tlsFingerprint: mockHost2.fingerprint,
+        hostKeyToken: mockHost2.hostKeyToken,
+        availableSlots: 0,
+        totalSlots: 1,
+      }),
+    ];
+
+    mockHost.sessionRejectReason = 'busy';
+    mockHost2.sessionRejectReason = 'busy';
+
+    const result = await postStream(userServer.port, {
+      model: 'test-model',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+
+    expect(result.status).toBe(503);
+    expect(result.body.toLowerCase()).toContain('busy');
+
+    mockHost2.stop();
   }, 15_000);
 
   // ── Client disconnect → inference aborted ────────────────────────────────
