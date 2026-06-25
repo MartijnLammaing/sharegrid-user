@@ -15,6 +15,7 @@ import {
   startMockHost,
   makeConfig,
   logger,
+  makeHostListEntry,
   type MockRouter,
   type MockHost,
 } from './helpers.js';
@@ -25,13 +26,13 @@ describe('User integration — abort mid-inference', () => {
 
   beforeEach(async () => {
     mockHost = await startMockHost();
-    mockRouter = await startMockRouter([{
+    mockRouter = await startMockRouter([makeHostListEntry({
       hostId: 'host-1',
       modelName: 'test-model',
       endpoint: `127.0.0.1:${mockHost.port}`,
       tlsFingerprint: mockHost.fingerprint,
       hostKeyToken: mockHost.hostKeyToken,
-    }]);
+    })]);
   }, 15_000);
 
   afterEach(() => {

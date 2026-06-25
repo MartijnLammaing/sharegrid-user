@@ -11,6 +11,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import pino from 'pino';
 import { HostBusyError, HostNotFoundError, InvalidTokenError } from '@sharegrid/shared/errors';
+import type { HostListEntry } from '@sharegrid/shared/protocol';
 
 // ── Mock node:readline ────────────────────────────────────────────────────────
 
@@ -38,7 +39,14 @@ const logger = pino({ level: 'silent' });
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
 function makeModels(ids = ['model-0', 'model-1']) {
-  return ids.map((id) => ({ id, object: 'model' as const, owned_by: 'sharegrid' }));
+  return ids.map((id) => ({
+    id,
+    object: 'model' as const,
+    owned_by: 'sharegrid',
+    context_length: 4096,
+    sharegrid_available_slots: 1,
+    sharegrid_total_slots: 1,
+  }));
 }
 
 function makeHosts(ids = ['model-0', 'model-1']) {
@@ -48,6 +56,9 @@ function makeHosts(ids = ['model-0', 'model-1']) {
     endpoint: `10.0.0.${i}:9000`,
     tlsFingerprint: 'sha256:' + 'a'.repeat(64),
     hostKeyToken: `tok-${i}`,
+    contextSize: 4096,
+    availableSlots: 1,
+    totalSlots: 1,
   }));
 }
 
@@ -72,15 +83,18 @@ function queueAnswers(answers: string[]) {
  */
 function makeModelRegistry(models = makeModels(), hosts = makeHosts()) {
   let calls = 0;
+  const resolveHost = vi.fn().mockImplementation((id: string) => {
+    const host = hosts.find((h) => h.modelName === id);
+    if (!host) return Promise.reject(new HostNotFoundError(`no host for '${id}'`));
+    return Promise.resolve(host);
+  });
   return {
     getModels: vi.fn().mockImplementation(() =>
       Promise.resolve(calls++ === 0 ? models : []),
     ),
-    resolveHost: vi.fn().mockImplementation((id: string) => {
-      const host = hosts.find((h) => h.modelName === id);
-      if (!host) return Promise.reject(new HostNotFoundError(`no host for '${id}'`));
-      return Promise.resolve(host);
-    }),
+    resolveHost,
+    resolveHosts: vi.fn().mockImplementation(async (id: string): Promise<HostListEntry[]> => [await resolveHost(id)]),
+    invalidate: vi.fn(),
   };
 }
 
@@ -145,7 +159,7 @@ describe('CLI', () => {
   // ── Empty model list ────────────────────────────────────────────────────────
 
   it('prints a clear message and exits when model list is empty', async () => {
-    const registry = { getModels: vi.fn().mockResolvedValue([]), resolveHost: vi.fn() };
+    const registry = { getModels: vi.fn().mockResolvedValue([]), resolveHost: vi.fn(), resolveHosts: vi.fn(), invalidate: vi.fn() };
     const pool = makeSessionPool();
     queueAnswers([]);
 

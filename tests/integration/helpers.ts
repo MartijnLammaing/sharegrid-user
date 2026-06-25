@@ -244,6 +244,16 @@ export async function startMockHost(): Promise<MockHost> {
 
 // ── Config builder ────────────────────────────────────────────────────────────
 
+/** Build a HostListEntry for mock routers, with sensible slot defaults. */
+export function makeHostListEntry(overrides: Partial<HostListEntry> & Pick<HostListEntry, 'hostId' | 'modelName' | 'endpoint' | 'tlsFingerprint' | 'hostKeyToken'>): HostListEntry {
+  return {
+    contextSize: 4096,
+    availableSlots: 1,
+    totalSlots: 1,
+    ...overrides,
+  };
+}
+
 export function makeConfig(
   router: MockRouter,
   listenPort = 3000,

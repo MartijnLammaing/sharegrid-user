@@ -21,6 +21,7 @@ import {
   startMockHost,
   type MockRouter,
   type MockHost,
+  makeHostListEntry,
 } from './helpers.js';
 import { createRouterClient } from '../../src/router-client.js';
 import { createModelRegistry } from '../../src/model-registry.js';
@@ -64,13 +65,13 @@ describe('User integration — CLI mode', () => {
     process.removeAllListeners('SIGINT');
 
     mockHost = await startMockHost();
-    mockRouter = await startMockRouter([{
+    mockRouter = await startMockRouter([makeHostListEntry({
       hostId: 'host-1',
       modelName: 'test-model',
       endpoint: `127.0.0.1:${mockHost.port}`,
       tlsFingerprint: mockHost.fingerprint,
       hostKeyToken: mockHost.hostKeyToken,
-    }]);
+    })]);
 
     routerUrl = `https://127.0.0.1:${mockRouter.port}?fp=${mockRouter.fingerprint}&key=${mockRouter.userSecret}`;
   }, 15_000);

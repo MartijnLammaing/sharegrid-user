@@ -14,6 +14,7 @@ import {
   startMockHost,
   makeConfig,
   logger,
+  makeHostListEntry,
   type MockRouter,
   type MockHost,
 } from './helpers.js';
@@ -25,13 +26,13 @@ describe('User integration — rejections', () => {
   beforeEach(async () => {
     mockHost   = await startMockHost();
     mockRouter = await startMockRouter([
-      {
+      makeHostListEntry({
         hostId: 'host-1',
         modelName: 'test-model',
         endpoint: `127.0.0.1:${mockHost.port}`,
         tlsFingerprint: mockHost.fingerprint,
         hostKeyToken: mockHost.hostKeyToken,
-      },
+      }),
     ]);
   });
 

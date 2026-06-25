@@ -25,6 +25,9 @@ const fakeHost = {
   endpoint: '10.0.0.1:9000',
   tlsFingerprint: 'sha256:' + 'a'.repeat(64),
   hostKeyToken: 'tok',
+  contextSize: 4096,
+  availableSlots: 1,
+  totalSlots: 1,
 };
 
 const fakeHost2 = {
@@ -33,20 +36,27 @@ const fakeHost2 = {
   endpoint: '10.0.0.2:9000',
   tlsFingerprint: 'sha256:' + 'b'.repeat(64),
   hostKeyToken: 'tok2',
+  contextSize: 8192,
+  availableSlots: 1,
+  totalSlots: 1,
 };
 
 /** Build a mock SessionClient with controllable behaviour. */
 function makeMockClient(overrides: {
   alive?: boolean;
+  inferring?: boolean;
   openError?: Error;
 } = {}) {
   let alive = overrides.alive ?? true;
+  let inferring = overrides.inferring ?? false;
   return {
     openSession: vi.fn().mockImplementation(() =>
       overrides.openError ? Promise.reject(overrides.openError) : Promise.resolve(),
     ),
     isAlive: vi.fn().mockImplementation(() => alive),
+    isInferenceActive: vi.fn().mockImplementation(() => inferring),
     setAlive(v: boolean) { alive = v; },
+    setInferring(v: boolean) { inferring = v; },
     closeSession: vi.fn().mockResolvedValue(undefined),
     abort: vi.fn(),
     sendInferenceRequest: vi.fn().mockResolvedValue(undefined),
@@ -72,8 +82,8 @@ describe('HostSessionPool', () => {
     expect(result).toBe(client);
   });
 
-  it('second acquire for same hostId returns the existing session without re-opening', async () => {
-    const client = makeMockClient({ alive: true });
+  it('second acquire for same hostId returns the existing idle session without re-opening', async () => {
+    const client = makeMockClient({ alive: true, inferring: false });
     mockCreateSessionClient.mockReturnValue(client);
 
     const pool = createHostSessionPool({ logger });
@@ -85,7 +95,40 @@ describe('HostSessionPool', () => {
     expect(second).toBe(first);
   });
 
-  it('acquire opens a fresh session after the existing one has died', async () => {
+  it('second acquire while the existing session is inferring opens a new session', async () => {
+    const firstClient = makeMockClient({ alive: true, inferring: true });
+    const secondClient = makeMockClient({ alive: true, inferring: false });
+    mockCreateSessionClient
+      .mockReturnValueOnce(firstClient)
+      .mockReturnValueOnce(secondClient);
+
+    const pool = createHostSessionPool({ logger });
+    const first = await pool.acquire(fakeHost);
+    const second = await pool.acquire(fakeHost);
+
+    expect(mockCreateSessionClient).toHaveBeenCalledTimes(2);
+    expect(first).toBe(firstClient);
+    expect(second).toBe(secondClient);
+    expect(secondClient.openSession).toHaveBeenCalledWith(fakeHost);
+  });
+
+  it('acquire prunes dead sessions before reusing idle ones', async () => {
+    const dead = makeMockClient({ alive: false });
+    const fresh = makeMockClient({ alive: true });
+    mockCreateSessionClient
+      .mockReturnValueOnce(dead)
+      .mockReturnValueOnce(fresh);
+
+    const pool = createHostSessionPool({ logger });
+    await pool.acquire(fakeHost);
+
+    const result = await pool.acquire(fakeHost);
+    expect(mockCreateSessionClient).toHaveBeenCalledTimes(2);
+    expect(fresh.openSession).toHaveBeenCalledWith(fakeHost);
+    expect(result).toBe(fresh);
+  });
+
+  it('acquire opens a fresh session after all existing sessions have died', async () => {
     const dead = makeMockClient({ alive: true });
     const fresh = makeMockClient({ alive: true });
     mockCreateSessionClient
@@ -105,13 +148,16 @@ describe('HostSessionPool', () => {
   });
 
   it('closeAll calls closeSession on every stored session and clears the pool', async () => {
-    const client1 = makeMockClient();
-    const client2 = makeMockClient();
+    const client1 = makeMockClient({ alive: true, inferring: true });
+    const client2 = makeMockClient({ alive: true, inferring: false });
+    const client3 = makeMockClient({ alive: true, inferring: false });
     mockCreateSessionClient
       .mockReturnValueOnce(client1)
-      .mockReturnValueOnce(client2);
+      .mockReturnValueOnce(client2)
+      .mockReturnValueOnce(client3);
 
     const pool = createHostSessionPool({ logger });
+    await pool.acquire(fakeHost);
     await pool.acquire(fakeHost);
     await pool.acquire(fakeHost2);
 
@@ -119,6 +165,7 @@ describe('HostSessionPool', () => {
 
     expect(client1.closeSession).toHaveBeenCalledOnce();
     expect(client2.closeSession).toHaveBeenCalledOnce();
+    expect(client3.closeSession).toHaveBeenCalledOnce();
 
     // Pool is cleared — next acquire opens new sessions
     const fresh = makeMockClient();
@@ -134,10 +181,8 @@ describe('HostSessionPool', () => {
     const pool = createHostSessionPool({ logger });
     await expect(pool.acquire(fakeHost)).rejects.toThrow(HostBusyError);
 
-    // Pool should be empty — next acquire tries again
-    const ok = makeMockClient();
-    mockCreateSessionClient.mockReturnValueOnce(ok);
-    await pool.acquire(fakeHost);
-    expect(ok.openSession).toHaveBeenCalledWith(fakeHost);
+    // Pool should be empty — next acquire tries again with the same mock sequence
+    mockCreateSessionClient.mockReturnValueOnce(busy);
+    await expect(pool.acquire(fakeHost)).rejects.toThrow(HostBusyError);
   });
 });
