@@ -1,7 +1,7 @@
 {
   "name": "@sharegrid/user",
   "version": "0.1.0",
-  "description": "LLMUser — CLI for discovering and connecting to ShareGrid LLMHost inference sessions.",
+  "description": "LLMUser — dual-mode service: OpenAI-compatible HTTP server for OpenCode, or standalone interactive CLI for ShareGrid LLMHost inference.",
   "private": true,
   "type": "commonjs",
   "scripts": {
