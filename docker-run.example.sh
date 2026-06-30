@@ -15,4 +15,5 @@ cd sharegrid-user
 docker build -t sharegrid-user .
 
 ## Run
-docker run -it --rm -e SHAREGRID_ROUTER_URL="https://172.17.0.2:8443?fp=sha256:6059adc8a497ba0070f0f10af6ce130ae58a46c83e70c4ed98e12b5bfd01f98e&key=<user-secret-from-router-banner>" sharegrid-user:latest
+docker run -it --rm -e SHAREGRID_ROUTER_URL="aHR0cHM6Ly8xNzIuMTcuMC4yOjg0NDM/ZnA9c2hhMjU2OjYwNTlhZGM4YTQ5N2JhMDA3MGYwZjEwYWY2Y2UxMzBhZTU4YTQ2YzgzZTcwYzRlZDk4ZTEyYjViZmQwMWY5OGUma2V5PTx1c2VyLXNlY3JldC1mcm9tLXJvdXRlci1iYW5uZXI+" sharegrid-user:latest
+# Base64-encoded router URL — copy the SHAREGRID_USER_ROUTER_URL value from the router's startup output.
